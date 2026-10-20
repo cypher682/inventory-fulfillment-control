@@ -12,8 +12,8 @@ func TestLoadDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if cfg.Port != 8082 {
-		t.Fatalf("Port = %d, want 8082", cfg.Port)
+	if cfg.Port != 8092 {
+		t.Fatalf("Port = %d, want 8092", cfg.Port)
 	}
 	if cfg.ServiceName != "inventory" {
 		t.Fatalf("ServiceName = %q, want inventory", cfg.ServiceName)

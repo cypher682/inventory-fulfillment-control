@@ -16,9 +16,9 @@ type Config struct {
 func Load() (Config, error) {
 	cfg := Config{
 		ServiceName: "inventory",
-		Port:        8082,
+		Port:        8092,
 		LogLevel:    "info",
-		DatabaseURL: os.Getenv("DATABASE_URL"),
+		DatabaseURL: "postgres://inventory:inventory@localhost:5442/inventory?sslmode=disable",
 	}
 
 	if v := os.Getenv("SERVICE_NAME"); v != "" {

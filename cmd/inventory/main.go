@@ -12,6 +12,9 @@ import (
 
 	"github.com/cypher682/inventory-fulfillment-control/internal/config"
 	"github.com/cypher682/inventory-fulfillment-control/internal/health"
+	"github.com/cypher682/inventory-fulfillment-control/internal/inventory"
+	"github.com/cypher682/inventory-fulfillment-control/internal/outbox"
+	"github.com/cypher682/inventory-fulfillment-control/internal/store"
 )
 
 var version = "dev"
@@ -26,22 +29,42 @@ func main() {
 	log := newLogger(cfg.LogLevel)
 	slog.SetDefault(log)
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	pool, err := store.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		log.Error("connect database", "error", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	if err := store.Migrate(ctx, pool); err != nil {
+		log.Error("migrate database", "error", err)
+		os.Exit(1)
+	}
+
+	service := inventory.NewService(pool)
+	api := inventory.NewServer(service, version, log)
+
 	h := health.New(cfg.ServiceName, version)
+	h.AddCheck("database", func(ctx context.Context) error { return pool.Ping(ctx) })
+
 	mux := http.NewServeMux()
+	api.Register(mux)
 	mux.HandleFunc("GET /healthz", h.Liveness)
 	mux.HandleFunc("GET /readyz", h.Readiness)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr(),
-		Handler:           mux,
+		Handler:           api.Handler(mux),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	go outbox.Run(ctx, pool, log, time.Second)
 
 	go func() {
 		log.Info("server started", "addr", cfg.Addr(), "version", version)

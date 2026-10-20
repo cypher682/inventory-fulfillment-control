@@ -29,7 +29,7 @@ Scaffold. Inventory positions, reservations, allocation, transfers, and costing 
 ```sh
 go test ./...
 go run ./cmd/inventory
-curl localhost:8082/healthz
+curl localhost:8092/healthz
 ```
 
 Configuration is environment-based; see `.env.example`.

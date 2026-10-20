@@ -1,4 +1,6 @@
-.PHONY: build test test-race fmt vet run tidy up down
+TEST_DATABASE_URL ?= postgres://inventory:inventory@localhost:5442/inventory?sslmode=disable
+
+.PHONY: build test test-race test-integration fmt vet run tidy up down
 
 build:
 	go build -trimpath -ldflags "-X main.version=$$(git describe --tags --always --dirty 2>/dev/null || echo dev)" -o bin/inventory ./cmd/inventory
@@ -8,6 +10,10 @@ test:
 
 test-race:
 	CGO_ENABLED=1 go test -race ./...
+
+test-integration: up
+	@until docker compose -f deploy/docker-compose.yml exec -T postgres pg_isready -U inventory -d inventory >/dev/null 2>&1; do sleep 0.5; done
+	TEST_DATABASE_URL=$(TEST_DATABASE_URL) go test ./...
 
 fmt:
 	gofmt -w .
