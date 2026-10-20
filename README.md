@@ -33,8 +33,6 @@ MVP implemented on PostgreSQL. Correctness is enforced in the database transacti
 
 ## Documents
 
-- [Product overview](12-inventory-fulfillment-control.md)
-- [PRD](12-d01-prd.md)
 - [Architecture](docs/architecture.md)
 - [API reference](docs/api.md)
 - [MVP scope and limits](docs/mvp.md)
