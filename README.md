@@ -2,8 +2,6 @@
 
 High-scale inventory control plane for multi-location retailers, distributors, and 3PLs: strong-consistent reservations, deterministic allocation, ATP/CTP promising, transfer orders, and a reconcilable inventory sub-ledger.
 
-Part of the [flagship portfolio](https://github.com/cypher682/flagship-portfolio).
-
 ## Status
 
 Scaffold. Inventory positions, reservations, allocation, transfers, and costing are not implemented yet.
