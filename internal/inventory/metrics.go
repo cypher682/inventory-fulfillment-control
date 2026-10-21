@@ -23,6 +23,7 @@ type metrics struct {
 	expirations   atomic.Int64
 	adjustments   atomic.Int64
 	auditReads    atomic.Int64
+	authFailures  atomic.Int64
 
 	httpMu      sync.Mutex
 	httpCount   int64
@@ -61,6 +62,7 @@ func (m *metrics) writePrometheus(w io.Writer) {
 	fmt.Fprintf(w, "inventory_reservation_expirations_total %d\n", m.expirations.Load())
 	fmt.Fprintf(w, "inventory_adjustments_total %d\n", m.adjustments.Load())
 	fmt.Fprintf(w, "inventory_audit_reads_total %d\n", m.auditReads.Load())
+	fmt.Fprintf(w, "inventory_auth_failures_total %d\n", m.authFailures.Load())
 
 	m.httpMu.Lock()
 	defer m.httpMu.Unlock()

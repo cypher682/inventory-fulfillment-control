@@ -45,7 +45,10 @@ func main() {
 	}
 
 	service := inventory.NewService(pool)
-	api := inventory.NewServer(service, version, log)
+	api := inventory.NewServer(service, version, log).WithAuth(cfg.AuthRequired, cfg.APIKeys)
+	if cfg.AuthRequired {
+		log.Info("API key authentication enabled", "tenants", len(cfg.APIKeys))
+	}
 
 	h := health.New(cfg.ServiceName, version)
 	h.AddCheck("database", func(ctx context.Context) error { return pool.Ping(ctx) })

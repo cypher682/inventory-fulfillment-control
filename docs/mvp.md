@@ -23,7 +23,7 @@ Prove the core inventory invariant end to end before adding scale mechanics:
 | Events | append-only `inventory_events` + relay-ready outbox in the same transaction |
 | Audit | paginated events, movements, ledger, cost layers, and consumptions per tenant |
 | Reconciliation | snapshot-consistent check over movements, layers, reservations, ledger, transfers |
-| Authn/authz | intentionally out of scope; tenant header is trusted |
+| Authn | optional per-tenant API keys; scoped authz and user identity are out of scope |
 
 ## Invariants
 
@@ -38,6 +38,7 @@ Prove the core inventory invariant end to end before adding scale mechanics:
 9. An expired reservation cannot be confirmed; its reserved quantity is restored exactly once.
 10. An adjustment cannot consume quantity that is reserved for an active order.
 11. A ship or transfer consumes the oldest layers first; consuming a full layer takes its exact remaining value.
+12. With auth enabled, a valid key resolves to exactly one tenant and cannot be widened by `X-Tenant-ID`.
 
 ## Evidence
 
@@ -55,6 +56,9 @@ Prove the core inventory invariant end to end before adding scale mechanics:
 | `TestFIFONegativeAdjustmentUsesOldestLayers` | write-offs consume FIFO and preserve the sub-ledger |
 | `TestConcurrentConfirmationsConsumeFIFOExactly` | 100 concurrent confirms consume the layers exactly once and balance COGS |
 | `TestReplayRebuildsPositionsFromMovementLog` | replayed quantity/value match positions and drift is detected |
+| `TestAuthRequiresValidKey` | missing and invalid keys return 401 before reaching a handler |
+| `TestAuthBindsTenantToKey` | API keys resolve to one tenant and conflicting tenant headers return 403 |
+| `TestAuthLeavesHealthOpenAndCanBeDisabled` | probes stay open and auth can be disabled for local use |
 | `TestAuditQueriesAreTenantScopedAndPaginated` | audit pages are ordered, filtered, and isolated per tenant |
 | `TestOutboxRelayPublishesAndRetries` | relay marks success, records failures, and retries |
 | `TestTenantIsolation` | reads from another tenant cannot see a position or reservation |
@@ -70,12 +74,13 @@ Prove the core inventory invariant end to end before adding scale mechanics:
 - One database, one write path. Hot-SKU partitioning and sharded counters are deferred until the load test demands them.
 - The outbox relay is broker-agnostic but ships with a log publisher; no broker adapter is included.
 - Replay rebuilds positions from movements, not the full event stream; cost layers and reservations are verified by reconciliation instead.
+- API keys are static secrets with full tenant access; there is no rotation, scoped permission, or per-user identity.
 - No negative-stock backorders, lot tracking, serials, quality holds, or LIFO/specific identification in this MVP.
 
 ## Next milestones
 
 1. Broker-backed outbox publisher (Kafka/NATS) with consumer examples.
-2. Authentication and signed internal service identity.
+2. Key rotation, scoped permissions, and signed internal service identity.
 3. Partitioning strategy for hot `(tenant, location, sku)` rows.
 4. Lot/serial tracking and quality holds layered on top of FIFO.
 5. Full projection rebuild from `inventory_events`.

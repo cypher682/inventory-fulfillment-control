@@ -1,6 +1,7 @@
 package inventory
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,13 +14,24 @@ import (
 )
 
 type Server struct {
-	service *Service
-	version string
-	log     *slog.Logger
+	service      *Service
+	version      string
+	log          *slog.Logger
+	authRequired bool
+	apiKeys      map[string]string
 }
 
 func NewServer(service *Service, version string, log *slog.Logger) *Server {
 	return &Server{service: service, version: version, log: log}
+}
+
+func (s *Server) WithAuth(required bool, keys map[string]string) *Server {
+	s.authRequired = required
+	s.apiKeys = make(map[string]string, len(keys))
+	for tenant, key := range keys {
+		s.apiKeys[tenant] = key
+	}
+	return s
 }
 
 func (s *Server) Register(mux *http.ServeMux) {
@@ -403,6 +415,9 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) tenant(w http.ResponseWriter, r *http.Request) (string, bool) {
+	if tenant, ok := tenantFromContext(r.Context()); ok {
+		return tenant, true
+	}
 	tenant := strings.TrimSpace(r.Header.Get("X-Tenant-ID"))
 	if tenant == "" {
 		writeError(w, http.StatusBadRequest, "tenant_required", "X-Tenant-ID header is required")
@@ -458,6 +473,21 @@ func (s *Server) Handler(next http.Handler) http.Handler {
 				"duration_ms", time.Since(start).Milliseconds(),
 			)
 		}()
+
+		if s.authRequired && strings.HasPrefix(r.URL.Path, "/v1/") {
+			tenant, status := s.authenticate(r)
+			if status != 0 {
+				s.service.metrics.authFailures.Add(1)
+				if status == http.StatusUnauthorized {
+					rec.Header().Set("WWW-Authenticate", "Bearer")
+					writeError(rec, status, "unauthorized", "missing or invalid API key")
+				} else {
+					writeError(rec, status, "tenant_mismatch", "API key is not valid for the requested tenant")
+				}
+				return
+			}
+			r = r.WithContext(context.WithValue(r.Context(), tenantContextKey{}, tenant))
+		}
 
 		next.ServeHTTP(rec, r)
 	})

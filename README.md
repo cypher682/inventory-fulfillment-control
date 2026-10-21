@@ -4,7 +4,7 @@ High-scale inventory control plane for multi-location retailers, distributors, a
 
 ## Status
 
-v0.4 implemented on PostgreSQL. Correctness is enforced in the database transaction path and covered by integration tests, including concurrent oversell, expiry, and FIFO allocation tests.
+v0.5 implemented on PostgreSQL. Correctness is enforced in the database transaction path and covered by integration tests, including concurrent oversell, expiry, and FIFO allocation tests.
 
 | Stage | Scope | State |
 |-------|-------|-------|
@@ -16,7 +16,7 @@ v0.4 implemented on PostgreSQL. Correctness is enforced in the database transact
 | 5 | Event-sourced fulfillment pipeline | partial: append-only events, relay-ready outbox, movement-log replay verifier |
 | 6 | Costing + inventory sub-ledger | done: FIFO cost layers + double-entry postings |
 | 7 | Load testing + observability | done: concurrency tests, load harness with percentiles, Prometheus counters/histograms |
-| 8 | Multi-tenant controls + audit queries | done: tenant isolation and paginated audit APIs |
+| 8 | Multi-tenant controls + audit queries | done: tenant isolation, optional API keys, paginated audit APIs |
 
 ## What works
 
@@ -33,6 +33,7 @@ v0.4 implemented on PostgreSQL. Correctness is enforced in the database transact
 - The replay verifier rebuilds position quantity and value from the append-only movement log and reports drift; it is available as an API and as `cmd/replay`.
 - Audit APIs page through events, movements, ledger entries, cost layers, and layer consumptions per tenant.
 - Multi-tenant isolation is enforced in every query.
+- Optional per-tenant API keys bind each request to one tenant; health and metrics stay open for probes.
 
 ## Documents
 
@@ -48,6 +49,16 @@ go run ./cmd/inventory
 ```
 
 The service starts on `:8092` and runs migrations on startup. `DATABASE_URL` defaults to the compose database.
+
+## Authentication
+
+Authentication is off by default for the local demo. To require per-tenant keys:
+
+```sh
+AUTH_REQUIRED=true API_KEYS="demo:0123456789abcdef,acme:fedcba9876543210" go run ./cmd/inventory
+```
+
+Send the key as `X-API-Key` or `Authorization: Bearer <key>`. The key selects the tenant; a conflicting `X-Tenant-ID` returns `403`. Keys must be at least 16 characters and must not contain `,` or `:`.
 
 ```sh
 curl localhost:8092/healthz
@@ -101,6 +112,6 @@ migrations          migration notes (actual SQL is embedded in internal/store)
 - FIFO costing with per-layer remaining quantity and value; rounding is absorbed by the layer being fully consumed.
 - Reservation expiry is swept every 10 seconds by default (`EXPIRY_INTERVAL`); ATP accounts for expired claims before the sweep runs.
 - The outbox relay ships events through a pluggable publisher; the bundled publisher only logs. A broker adapter is not included.
-- No authentication; tenancy is asserted by the `X-Tenant-ID` header and must be trusted at the edge.
+- API keys are static per-tenant secrets from `API_KEYS`; there is no rotation, scopes, or user identity. When auth is disabled, tenancy is asserted by `X-Tenant-ID` and must be trusted at the edge.
 - Replay verifies positions from movements; it does not rebuild cost layers or reservations from the event stream.
 - No partition/sharding for hot rows yet; correctness is proven before throughput optimization.

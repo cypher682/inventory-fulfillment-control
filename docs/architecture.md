@@ -7,7 +7,8 @@ Modular monolith with a single write path per inventory position:
 ```
 cmd/inventory        HTTP API + lifecycle + expiry sweeper
 cmd/loadtest         HTTP concurrency and latency harness
-internal/inventory   positions, reservations, transfers, adjustments, ATP, audit, ledger
+cmd/replay           movement-log replay verifier
+internal/inventory   positions, reservations, transfers, adjustments, ATP, audit, ledger, auth
 internal/store       pgx pool + embedded migrations
 internal/outbox      lease-based transactional outbox relay with pluggable publishers
 ```
@@ -97,6 +98,12 @@ This verifies the position projection, not the whole event-sourced history: cost
 5. In-transit ledger = value of in-transit transfers = pending transfer-layer value.
 6. Movement value deltas = layer consumptions and additions for the position.
 
+## Authentication
+
+When `AUTH_REQUIRED=true`, every `/v1` request must present a key from `API_KEYS` as `X-API-Key` or `Authorization: Bearer`. The middleware resolves the key to exactly one tenant with a constant-time comparison, stores that tenant in the request context, and rejects a conflicting `X-Tenant-ID` with `403`. Handlers read the tenant from the context, so a validated key cannot be widened by headers.
+
+`/healthz`, `/readyz`, and `/metrics` stay open for probes and scraping. Keys are static per-tenant secrets and grant full tenant access; rotation, scopes, and user identity are out of scope.
+
 ## Background workers
 
 - Expiry sweeper runs every `EXPIRY_INTERVAL` (default 10s), processes `EXPIRY_BATCH` rows per tick, and emits `reservation.expired`.
@@ -109,11 +116,12 @@ This verifies the position projection, not the whole event-sourced history: cost
 - A crash after commit is safe to retry; the stored response is returned.
 - The outbox guarantees an event exists for every committed state change. A crash after claiming delays delivery until the lease expires; a crash after publishing but before marking can duplicate delivery.
 - Reconciliation uses a repeatable-read snapshot so concurrent writes cannot produce false drift.
+- Missing, invalid, or tenant-mismatched API keys are rejected before any handler or database work.
 
 ## Not implemented yet
 
 - Full projection rebuild from `inventory_events` (replay currently uses the movement log).
 - Broker-backed outbox publisher.
-- Authentication and authorization.
+- Key rotation, scoped authorization, and user identity.
 - Lot/serial tracking, quality holds, and LIFO/specific identification.
 - Partitioning for extreme hot-key contention.

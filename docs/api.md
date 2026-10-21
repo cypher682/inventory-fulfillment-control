@@ -1,8 +1,14 @@
 # API Reference
 
-Base path: `/v1`. All requests require `X-Tenant-ID`. Mutating requests may send `X-Idempotency-Key`; reusing a key with the same body returns the original response with `Idempotent-Replayed: true`. Reusing it with a different body returns `422`.
+Base path: `/v1`. All requests require a tenant. Mutating requests may send `X-Idempotency-Key`; reusing a key with the same body returns the original response with `Idempotent-Replayed: true`. Reusing it with a different body returns `422`.
 
 `X-Actor` is optional and recorded in events (default `api`).
+
+## Authentication
+
+Auth is disabled by default. When the service runs with `AUTH_REQUIRED=true`, send a key from `API_KEYS` as `X-API-Key: <key>` or `Authorization: Bearer <key>`. The key selects the tenant, so `X-Tenant-ID` is optional but must match when present. `X-API-Key` takes precedence when both key headers are sent.
+
+`/healthz`, `/readyz`, and `/metrics` do not require a key. Invalid or missing keys return `401` with `WWW-Authenticate: Bearer`; a key used with a different `X-Tenant-ID` returns `403`.
 
 ## Errors
 
@@ -17,7 +23,9 @@ Base path: `/v1`. All requests require `X-Tenant-ID`. Mutating requests may send
 
 | Status | Code | Meaning |
 |--------|------|---------|
-| 400 | `validation` / `invalid_json` / `tenant_required` | bad input or missing tenant header |
+| 400 | `validation` / `invalid_json` / `tenant_required` | bad input or missing tenant |
+| 401 | `unauthorized` | missing or invalid API key when auth is required |
+| 403 | `tenant_mismatch` | API key does not belong to the requested tenant |
 | 404 | `not_found` | unknown position, reservation, or transfer in this tenant |
 | 409 | `insufficient_stock` | available quantity is too low |
 | 409 | `invalid_state` | reservation is already released/confirmed |
