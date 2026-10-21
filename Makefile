@@ -1,4 +1,5 @@
 TEST_DATABASE_URL ?= postgres://inventory:inventory@localhost:5442/inventory?sslmode=disable
+TEST_NATS_URL ?= nats://localhost:4222
 
 .PHONY: build test test-race test-integration fmt vet run tidy up down
 
@@ -13,7 +14,8 @@ test-race:
 
 test-integration: up
 	@until docker compose -f deploy/docker-compose.yml exec -T postgres pg_isready -U inventory -d inventory >/dev/null 2>&1; do sleep 0.5; done
-	TEST_DATABASE_URL=$(TEST_DATABASE_URL) go test ./...
+	@sleep 1
+	TEST_DATABASE_URL=$(TEST_DATABASE_URL) TEST_NATS_URL=$(TEST_NATS_URL) go test ./...
 
 fmt:
 	gofmt -w .

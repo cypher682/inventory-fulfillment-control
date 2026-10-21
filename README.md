@@ -4,7 +4,7 @@ High-scale inventory control plane for multi-location retailers, distributors, a
 
 ## Status
 
-v0.5 implemented on PostgreSQL. Correctness is enforced in the database transaction path and covered by integration tests, including concurrent oversell, expiry, and FIFO allocation tests.
+v0.6 implemented on PostgreSQL, with optional NATS JetStream delivery. Correctness is enforced in the database transaction path and covered by integration tests, including concurrent oversell, expiry, and FIFO allocation tests.
 
 | Stage | Scope | State |
 |-------|-------|-------|
@@ -13,7 +13,7 @@ v0.5 implemented on PostgreSQL. Correctness is enforced in the database transact
 | 2 | State machine + inventory transactions, adjustments, expiry | done |
 | 3 | Multi-location + transfer orders | done |
 | 4 | ATP / promising engine | done (single-hop, in-transit and expiry aware) |
-| 5 | Event-sourced fulfillment pipeline | partial: append-only events, relay-ready outbox, movement-log replay verifier |
+| 5 | Event-sourced fulfillment pipeline | done: append-only events, durable outbox delivery, replay verifier |
 | 6 | Costing + inventory sub-ledger | done: FIFO cost layers + double-entry postings |
 | 7 | Load testing + observability | done: concurrency tests, load harness with percentiles, Prometheus counters/histograms |
 | 8 | Multi-tenant controls + audit queries | done: tenant isolation, optional API keys, paginated audit APIs |
@@ -29,6 +29,7 @@ v0.5 implemented on PostgreSQL. Correctness is enforced in the database transact
 - Adjustments and cycle-count corrections post to `inventory_adjustment`, cannot consume reserved stock, and keep the sub-ledger balanced.
 - Idempotency keys make mutations safely retryable.
 - Append-only inventory events and a transactional outbox are written in the same transaction; the relay supports leases, retries, and backoff.
+- The relay can deliver to NATS JetStream (durable, acked, deduplicated by outbox ID), an HMAC-signed HTTP webhook, or the log.
 - Reconciliation runs on a repeatable-read snapshot and checks position vs movements, cost layers, reservations, ledger balance, inventory value, and in-transit value.
 - The replay verifier rebuilds position quantity and value from the append-only movement log and reports drift; it is available as an API and as `cmd/replay`.
 - Audit APIs page through events, movements, ledger entries, cost layers, and layer consumptions per tenant.
@@ -65,6 +66,24 @@ curl localhost:8092/healthz
 ./scripts/demo.sh
 ```
 
+## Outbox delivery
+
+`OUTBOX_PUBLISHER` selects the transport:
+
+- `log` (default): log the event envelope.
+- `nats`: publish to JetStream with `NATS_URL` (default `nats://localhost:4222`) and `NATS_STREAM` (default `inventory`). The service creates a durable stream on `inventory.>`; set `NATS_SUBJECT_PREFIX` (must end with `.`) to deploy under a prefix.
+- `webhook`: POST to `WEBHOOK_URL` with `X-Inventory-Signature: t=<unix>,v1=<hex HMAC-SHA256>` over `<unix>.<body>` using `WEBHOOK_SECRET` (at least 16 characters).
+
+The compose stack includes NATS on `:4222`. A minimal consumer is included:
+
+```sh
+docker compose -f deploy/docker-compose.yml up -d
+OUTBOX_PUBLISHER=nats go run ./cmd/inventory
+go run ./cmd/natsconsumer
+```
+
+The NATS publisher waits for a broker ack and uses the outbox ID as the JetStream message ID, so a retry after a lost publish is deduplicated. Webhook delivery is at-least-once; consumers should deduplicate by `X-Outbox-ID`.
+
 ## Load test
 
 Start the service, then:
@@ -86,9 +105,11 @@ The command rebuilds positions from the movement log, prints the report as JSON,
 ## Tests
 
 ```sh
-make test-integration   # starts Postgres, runs unit + integration tests
+make test-integration   # starts Postgres + NATS, runs unit + integration tests
 make test-race          # race detector (integration tests skip without TEST_DATABASE_URL)
 ```
+
+The NATS test also skips unless `TEST_NATS_URL` is set; `make test-integration` sets it.
 
 ## Layout
 
@@ -96,13 +117,14 @@ make test-race          # race detector (integration tests skip without TEST_DAT
 cmd/inventory       service entrypoint
 cmd/loadtest        HTTP concurrency / oversell harness
 cmd/replay          rebuild positions from the movement log and report drift
+cmd/natsconsumer    minimal JetStream consumer example
 internal/config     env config
 internal/health     liveness/readiness
 internal/inventory  domain, HTTP API, ledger, reconciliation
 internal/store      connection + embedded migrations
-internal/outbox      outbox relay with leases, retries, and a pluggable publisher
+internal/outbox     outbox relay with leases, retries, NATS/webhook publishers
 docs                architecture, API, MVP scope
-deploy              local Postgres
+deploy              local Postgres and NATS
 migrations          migration notes (actual SQL is embedded in internal/store)
 ```
 
@@ -111,7 +133,7 @@ migrations          migration notes (actual SQL is embedded in internal/store)
 - Single currency; all values are integer cents.
 - FIFO costing with per-layer remaining quantity and value; rounding is absorbed by the layer being fully consumed.
 - Reservation expiry is swept every 10 seconds by default (`EXPIRY_INTERVAL`); ATP accounts for expired claims before the sweep runs.
-- The outbox relay ships events through a pluggable publisher; the bundled publisher only logs. A broker adapter is not included.
+- NATS delivery is at-least-once with a one-hour dedupe window; webhook delivery is at-least-once and relies on the receiver for idempotency. There is no dead-letter stream or schema registry.
 - API keys are static per-tenant secrets from `API_KEYS`; there is no rotation, scopes, or user identity. When auth is disabled, tenancy is asserted by `X-Tenant-ID` and must be trusted at the edge.
 - Replay verifies positions from movements; it does not rebuild cost layers or reservations from the event stream.
 - No partition/sharding for hot rows yet; correctness is proven before throughput optimization.

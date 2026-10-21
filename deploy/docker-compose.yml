@@ -15,5 +15,14 @@ services:
     volumes:
       - inventory-postgres:/var/lib/postgresql/data
 
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "-sd", "/data"]
+    ports:
+      - "4222:4222"
+    volumes:
+      - inventory-nats:/data
+
 volumes:
   inventory-postgres:
+  inventory-nats:

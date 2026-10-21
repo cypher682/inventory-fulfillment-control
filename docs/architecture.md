@@ -10,7 +10,7 @@ cmd/loadtest         HTTP concurrency and latency harness
 cmd/replay           movement-log replay verifier
 internal/inventory   positions, reservations, transfers, adjustments, ATP, audit, ledger, auth
 internal/store       pgx pool + embedded migrations
-internal/outbox      lease-based transactional outbox relay with pluggable publishers
+internal/outbox      lease-based relay with log, NATS JetStream, and HMAC webhook publishers
 ```
 
 ## Data model
@@ -104,10 +104,18 @@ When `AUTH_REQUIRED=true`, every `/v1` request must present a key from `API_KEYS
 
 `/healthz`, `/readyz`, and `/metrics` stay open for probes and scraping. Keys are static per-tenant secrets and grant full tenant access; rotation, scopes, and user identity are out of scope.
 
+## Outbox delivery
+
+The relay claims a batch under a 30s lease, publishes each envelope, marks success, and records failures with exponential backoff. Delivery is at-least-once.
+
+- `log` is the default and is useful for local demos.
+- `nats` publishes synchronously to JetStream and waits for a broker ack. A stream (default `inventory`) covers `inventory.>` and stores seven days of file-backed messages. The outbox ID is the `Nats-Msg-Id`, so a retry after a lost ack is deduplicated within the one-hour window. `cmd/natsconsumer` is a durable-consumer example.
+- `webhook` posts the envelope with `X-Outbox-ID`, tenant/topic/attempt headers, and `X-Inventory-Signature: t=<unix>,v1=<hex>`, where the HMAC-SHA256 covers `<unix>.<body>`. Any non-2xx response becomes a relay failure and is retried; receivers should enforce a timestamp window and deduplicate by `X-Outbox-ID`.
+
 ## Background workers
 
 - Expiry sweeper runs every `EXPIRY_INTERVAL` (default 10s), processes `EXPIRY_BATCH` rows per tick, and emits `reservation.expired`.
-- Outbox relay claims a batch under a 30s lease, publishes each envelope, marks success, and records failures with exponential backoff. Delivery is at-least-once; the bundled publisher logs only.
+- Outbox relay runs every `OUTBOX_INTERVAL` (default 1s) with `OUTBOX_BATCH` messages.
 
 ## Failure handling
 
@@ -115,13 +123,14 @@ When `AUTH_REQUIRED=true`, every `/v1` request must present a key from `API_KEYS
 - A crash before commit leaves no partial movement or ledger entry.
 - A crash after commit is safe to retry; the stored response is returned.
 - The outbox guarantees an event exists for every committed state change. A crash after claiming delays delivery until the lease expires; a crash after publishing but before marking can duplicate delivery.
+- NATS deduplicates retries by outbox ID within the stream window. Webhook receivers must deduplicate by `X-Outbox-ID`; the relay does not track receiver-side processing.
 - Reconciliation uses a repeatable-read snapshot so concurrent writes cannot produce false drift.
 - Missing, invalid, or tenant-mismatched API keys are rejected before any handler or database work.
 
 ## Not implemented yet
 
 - Full projection rebuild from `inventory_events` (replay currently uses the movement log).
-- Broker-backed outbox publisher.
+- Dead-letter stream, consumer lag monitoring, and a schema registry.
 - Key rotation, scoped authorization, and user identity.
 - Lot/serial tracking, quality holds, and LIFO/specific identification.
 - Partitioning for extreme hot-key contention.

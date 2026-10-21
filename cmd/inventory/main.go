@@ -67,7 +67,28 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	relay := outbox.NewRelay(pool, outbox.LogPublisher{Log: log}, log).
+	var publisher outbox.Publisher
+	var closePublisher func()
+	switch cfg.OutboxPublisher {
+	case "nats":
+		natsPublisher, err := outbox.NewNATSPublisher(ctx, cfg.NATSURL, cfg.NATSStream, cfg.NATSSubjectPrefix)
+		if err != nil {
+			log.Error("connect outbox broker", "error", err)
+			os.Exit(1)
+		}
+		publisher = natsPublisher
+		closePublisher = func() { _ = natsPublisher.Close() }
+	case "webhook":
+		publisher = outbox.NewWebhookPublisher(cfg.WebhookURL, cfg.WebhookSecret)
+		closePublisher = func() {}
+	default:
+		publisher = outbox.LogPublisher{Log: log}
+		closePublisher = func() {}
+	}
+	defer closePublisher()
+	log.Info("outbox publisher configured", "mode", cfg.OutboxPublisher)
+
+	relay := outbox.NewRelay(pool, publisher, log).
 		WithInterval(cfg.OutboxInterval).
 		WithBatch(cfg.OutboxBatch)
 	go relay.Run(ctx)

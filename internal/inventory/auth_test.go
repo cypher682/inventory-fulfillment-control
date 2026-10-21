@@ -139,12 +139,14 @@ func TestAuthLeavesHealthOpenAndCanBeDisabled(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("health status = %d, want 200", resp.StatusCode)
 	}
+	resp.Body.Close()
 
 	openServer, _ := authTestServer(t, false, nil)
 	resp, _ = authRequest(t, openServer.Client(), openServer.URL+"/v1/whoami", "", "", "demo")
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("auth disabled status = %d, want 200", resp.StatusCode)
 	}
+	resp.Body.Close()
 }
 
 func TestHTTPAuthProtectsInventoryRoutes(t *testing.T) {

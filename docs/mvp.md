@@ -20,7 +20,8 @@ Prove the core inventory invariant end to end before adding scale mechanics:
 | Adjustments | signed quantity change with a required reason; negative deltas consume FIFO |
 | ATP | available = on-hand - reserved + expired-not-yet-swept; incoming in-transit |
 | Idempotency | `idempotency_keys`, request hash, stored response |
-| Events | append-only `inventory_events` + relay-ready outbox in the same transaction |
+| Events | append-only `inventory_events` + outbox in the same transaction |
+| Delivery | log, NATS JetStream with ack/dedupe, or HMAC-signed HTTP webhook |
 | Audit | paginated events, movements, ledger, cost layers, and consumptions per tenant |
 | Reconciliation | snapshot-consistent check over movements, layers, reservations, ledger, transfers |
 | Authn | optional per-tenant API keys; scoped authz and user identity are out of scope |
@@ -59,6 +60,8 @@ Prove the core inventory invariant end to end before adding scale mechanics:
 | `TestAuthRequiresValidKey` | missing and invalid keys return 401 before reaching a handler |
 | `TestAuthBindsTenantToKey` | API keys resolve to one tenant and conflicting tenant headers return 403 |
 | `TestAuthLeavesHealthOpenAndCanBeDisabled` | probes stay open and auth can be disabled for local use |
+| `TestNATSPublisherPersistsAndDeduplicates` | JetStream stores the event and redelivers one copy for a repeated outbox ID |
+| `TestWebhookPublisherSignsAndDelivers` | webhook headers, body, and HMAC signature match the contract |
 | `TestAuditQueriesAreTenantScopedAndPaginated` | audit pages are ordered, filtered, and isolated per tenant |
 | `TestOutboxRelayPublishesAndRetries` | relay marks success, records failures, and retries |
 | `TestTenantIsolation` | reads from another tenant cannot see a position or reservation |
@@ -75,12 +78,13 @@ Prove the core inventory invariant end to end before adding scale mechanics:
 - The outbox relay is broker-agnostic but ships with a log publisher; no broker adapter is included.
 - Replay rebuilds positions from movements, not the full event stream; cost layers and reservations are verified by reconciliation instead.
 - API keys are static secrets with full tenant access; there is no rotation, scoped permission, or per-user identity.
+- Outbox delivery is at-least-once. NATS dedupes by outbox ID for one hour; webhook receivers must dedupe themselves. There is no dead-letter stream or schema registry.
 - No negative-stock backorders, lot tracking, serials, quality holds, or LIFO/specific identification in this MVP.
 
 ## Next milestones
 
-1. Broker-backed outbox publisher (Kafka/NATS) with consumer examples.
-2. Key rotation, scoped permissions, and signed internal service identity.
-3. Partitioning strategy for hot `(tenant, location, sku)` rows.
-4. Lot/serial tracking and quality holds layered on top of FIFO.
-5. Full projection rebuild from `inventory_events`.
+1. Key rotation, scoped permissions, and signed internal service identity.
+2. Partitioning strategy for hot `(tenant, location, sku)` rows.
+3. Lot/serial tracking and quality holds layered on top of FIFO.
+4. Full projection rebuild from `inventory_events`.
+5. Dead-letter stream, consumer lag monitoring, and a schema registry.

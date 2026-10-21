@@ -16,6 +16,12 @@ func TestLoadDefaults(t *testing.T) {
 	t.Setenv("OUTBOX_BATCH", "")
 	t.Setenv("AUTH_REQUIRED", "")
 	t.Setenv("API_KEYS", "")
+	t.Setenv("OUTBOX_PUBLISHER", "")
+	t.Setenv("NATS_URL", "")
+	t.Setenv("NATS_STREAM", "")
+	t.Setenv("NATS_SUBJECT_PREFIX", "")
+	t.Setenv("WEBHOOK_URL", "")
+	t.Setenv("WEBHOOK_SECRET", "")
 
 	cfg, err := Load()
 	if err != nil {
@@ -38,6 +44,53 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if cfg.AuthRequired || len(cfg.APIKeys) != 0 {
 		t.Fatalf("auth defaults = %v/%v, want disabled and empty", cfg.AuthRequired, cfg.APIKeys)
+	}
+	if cfg.OutboxPublisher != "log" || cfg.NATSURL != "nats://localhost:4222" || cfg.NATSStream != "inventory" {
+		t.Fatalf("publisher defaults = %q %q %q", cfg.OutboxPublisher, cfg.NATSURL, cfg.NATSStream)
+	}
+}
+
+func TestLoadPublisherConfig(t *testing.T) {
+	t.Setenv("OUTBOX_PUBLISHER", "NATS")
+	t.Setenv("NATS_URL", "nats://nats:4222")
+	t.Setenv("NATS_STREAM", "inventory-prod")
+	t.Setenv("NATS_SUBJECT_PREFIX", "prod.")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() nats error = %v", err)
+	}
+	if cfg.OutboxPublisher != "nats" || cfg.NATSSubjectPrefix != "prod." {
+		t.Fatalf("nats config = %+v", cfg)
+	}
+
+	t.Setenv("OUTBOX_PUBLISHER", "webhook")
+	t.Setenv("WEBHOOK_URL", "https://events.example.com/inventory")
+	t.Setenv("WEBHOOK_SECRET", "0123456789abcdef")
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load() webhook error = %v", err)
+	}
+}
+
+func TestLoadRejectsInvalidPublisher(t *testing.T) {
+	for _, tc := range []struct {
+		publisher, url, secret, stream, prefix string
+	}{
+		{publisher: "kafka"},
+		{publisher: "nats", url: "nats://localhost:4222", stream: "bad.stream"},
+		{publisher: "nats", url: "nats://localhost:4222", stream: "inventory", prefix: "prod"},
+		{publisher: "webhook", url: "", secret: "0123456789abcdef"},
+		{publisher: "webhook", url: "ftp://example.com", secret: "0123456789abcdef"},
+		{publisher: "webhook", url: "https://example.com", secret: "short"},
+	} {
+		t.Setenv("OUTBOX_PUBLISHER", tc.publisher)
+		t.Setenv("NATS_URL", tc.url)
+		t.Setenv("NATS_STREAM", tc.stream)
+		t.Setenv("NATS_SUBJECT_PREFIX", tc.prefix)
+		t.Setenv("WEBHOOK_URL", tc.url)
+		t.Setenv("WEBHOOK_SECRET", tc.secret)
+		if _, err := Load(); err == nil {
+			t.Fatalf("Load() publisher=%q url=%q = nil error", tc.publisher, tc.url)
+		}
 	}
 }
 

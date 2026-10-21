@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -11,29 +12,38 @@ import (
 const minAPIKeyLength = 16
 
 type Config struct {
-	ServiceName    string
-	Port           int
-	LogLevel       string
-	DatabaseURL    string
-	ExpiryInterval time.Duration
-	ExpiryBatch    int
-	OutboxInterval time.Duration
-	OutboxBatch    int
-	AuthRequired   bool
-	APIKeys        map[string]string
+	ServiceName       string
+	Port              int
+	LogLevel          string
+	DatabaseURL       string
+	ExpiryInterval    time.Duration
+	ExpiryBatch       int
+	OutboxInterval    time.Duration
+	OutboxBatch       int
+	OutboxPublisher   string
+	NATSURL           string
+	NATSStream        string
+	NATSSubjectPrefix string
+	WebhookURL        string
+	WebhookSecret     string
+	AuthRequired      bool
+	APIKeys           map[string]string
 }
 
 func Load() (Config, error) {
 	cfg := Config{
-		ServiceName:    "inventory",
-		Port:           8092,
-		LogLevel:       "info",
-		DatabaseURL:    "postgres://inventory:inventory@localhost:5442/inventory?sslmode=disable",
-		ExpiryInterval: 10 * time.Second,
-		ExpiryBatch:    100,
-		OutboxInterval: time.Second,
-		OutboxBatch:    100,
-		APIKeys:        make(map[string]string),
+		ServiceName:     "inventory",
+		Port:            8092,
+		LogLevel:        "info",
+		DatabaseURL:     "postgres://inventory:inventory@localhost:5442/inventory?sslmode=disable",
+		ExpiryInterval:  10 * time.Second,
+		ExpiryBatch:     100,
+		OutboxInterval:  time.Second,
+		OutboxBatch:     100,
+		OutboxPublisher: "log",
+		NATSURL:         "nats://localhost:4222",
+		NATSStream:      "inventory",
+		APIKeys:         make(map[string]string),
 	}
 
 	if v := os.Getenv("SERVICE_NAME"); v != "" {
@@ -77,6 +87,27 @@ func Load() (Config, error) {
 		}
 		cfg.OutboxBatch = batch
 	}
+	if v := os.Getenv("OUTBOX_PUBLISHER"); v != "" {
+		cfg.OutboxPublisher = strings.ToLower(strings.TrimSpace(v))
+	}
+	if v := os.Getenv("NATS_URL"); v != "" {
+		cfg.NATSURL = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("NATS_STREAM"); v != "" {
+		cfg.NATSStream = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("NATS_SUBJECT_PREFIX"); v != "" {
+		cfg.NATSSubjectPrefix = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("WEBHOOK_URL"); v != "" {
+		cfg.WebhookURL = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("WEBHOOK_SECRET"); v != "" {
+		cfg.WebhookSecret = v
+	}
+	if err := validatePublisher(cfg); err != nil {
+		return Config{}, err
+	}
 	if v := os.Getenv("AUTH_REQUIRED"); v != "" {
 		required, err := strconv.ParseBool(v)
 		if err != nil {
@@ -96,6 +127,37 @@ func Load() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func validatePublisher(cfg Config) error {
+	switch cfg.OutboxPublisher {
+	case "log":
+		return nil
+	case "nats":
+		if cfg.NATSURL == "" {
+			return fmt.Errorf("OUTBOX_PUBLISHER=nats requires NATS_URL")
+		}
+		if cfg.NATSStream == "" || strings.ContainsAny(cfg.NATSStream, ".*>/\\ \t\n") {
+			return fmt.Errorf("invalid NATS_STREAM %q", cfg.NATSStream)
+		}
+		if prefix := cfg.NATSSubjectPrefix; prefix != "" {
+			if !strings.HasSuffix(prefix, ".") || strings.ContainsAny(prefix, "*> \t\n") {
+				return fmt.Errorf("NATS_SUBJECT_PREFIX %q must end with '.' and contain no wildcards or spaces", prefix)
+			}
+		}
+		return nil
+	case "webhook":
+		parsed, err := url.Parse(cfg.WebhookURL)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+			return fmt.Errorf("OUTBOX_PUBLISHER=webhook requires a valid HTTP(S) WEBHOOK_URL")
+		}
+		if len(cfg.WebhookSecret) < minAPIKeyLength {
+			return fmt.Errorf("WEBHOOK_SECRET must be at least %d characters", minAPIKeyLength)
+		}
+		return nil
+	default:
+		return fmt.Errorf("invalid OUTBOX_PUBLISHER %q: must be log, nats, or webhook", cfg.OutboxPublisher)
+	}
 }
 
 func parseAPIKeys(raw string) (map[string]string, error) {
