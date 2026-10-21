@@ -35,6 +35,7 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/transfers/{id}", s.getTransfer)
 	mux.HandleFunc("POST /v1/transfers/{id}/receive", s.receiveTransfer)
 	mux.HandleFunc("GET /v1/reconciliation", s.reconcile)
+	mux.HandleFunc("GET /v1/audit/replay", s.replay)
 	mux.HandleFunc("GET /v1/audit/events", s.listEvents)
 	mux.HandleFunc("GET /v1/audit/movements", s.listMovements)
 	mux.HandleFunc("GET /v1/audit/ledger", s.listLedger)
@@ -223,6 +224,23 @@ func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusConflict
 	}
 	writeJSON(w, status, result)
+}
+
+func (s *Server) replay(w http.ResponseWriter, r *http.Request) {
+	tenant, ok := s.tenant(w, r)
+	if !ok {
+		return
+	}
+	report, err := s.service.Replay(r.Context(), tenant)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	status := http.StatusOK
+	if !report.OK {
+		status = http.StatusConflict
+	}
+	writeJSON(w, status, report)
 }
 
 func (s *Server) listEvents(w http.ResponseWriter, r *http.Request) {

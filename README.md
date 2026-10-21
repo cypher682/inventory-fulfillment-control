@@ -4,7 +4,7 @@ High-scale inventory control plane for multi-location retailers, distributors, a
 
 ## Status
 
-v0.2 implemented on PostgreSQL. Correctness is enforced in the database transaction path and covered by integration tests, including concurrent oversell and expiry tests.
+v0.4 implemented on PostgreSQL. Correctness is enforced in the database transaction path and covered by integration tests, including concurrent oversell, expiry, and FIFO allocation tests.
 
 | Stage | Scope | State |
 |-------|-------|-------|
@@ -13,7 +13,7 @@ v0.2 implemented on PostgreSQL. Correctness is enforced in the database transact
 | 2 | State machine + inventory transactions, adjustments, expiry | done |
 | 3 | Multi-location + transfer orders | done |
 | 4 | ATP / promising engine | done (single-hop, in-transit and expiry aware) |
-| 5 | Event-sourced fulfillment pipeline | partial: append-only events + relay-ready outbox, no replay/rebuild |
+| 5 | Event-sourced fulfillment pipeline | partial: append-only events, relay-ready outbox, movement-log replay verifier |
 | 6 | Costing + inventory sub-ledger | done: FIFO cost layers + double-entry postings |
 | 7 | Load testing + observability | done: concurrency tests, load harness with percentiles, Prometheus counters/histograms |
 | 8 | Multi-tenant controls + audit queries | done: tenant isolation and paginated audit APIs |
@@ -30,6 +30,7 @@ v0.2 implemented on PostgreSQL. Correctness is enforced in the database transact
 - Idempotency keys make mutations safely retryable.
 - Append-only inventory events and a transactional outbox are written in the same transaction; the relay supports leases, retries, and backoff.
 - Reconciliation runs on a repeatable-read snapshot and checks position vs movements, cost layers, reservations, ledger balance, inventory value, and in-transit value.
+- The replay verifier rebuilds position quantity and value from the append-only movement log and reports drift; it is available as an API and as `cmd/replay`.
 - Audit APIs page through events, movements, ledger entries, cost layers, and layer consumptions per tenant.
 - Multi-tenant isolation is enforced in every query.
 
@@ -63,6 +64,14 @@ go run ./cmd/loadtest -stock 100 -attempts 500 -workers 64
 
 The command seeds stock, fires concurrent reservations, prints p50/p95/p99 latency, and fails if more than the available stock is reserved or if reconciliation is not clean.
 
+## Replay
+
+```sh
+go run ./cmd/replay -tenant demo
+```
+
+The command rebuilds positions from the movement log, prints the report as JSON, and exits non-zero on drift. The API exposes the same check at `GET /v1/audit/replay`.
+
 ## Tests
 
 ```sh
@@ -75,6 +84,7 @@ make test-race          # race detector (integration tests skip without TEST_DAT
 ```
 cmd/inventory       service entrypoint
 cmd/loadtest        HTTP concurrency / oversell harness
+cmd/replay          rebuild positions from the movement log and report drift
 internal/config     env config
 internal/health     liveness/readiness
 internal/inventory  domain, HTTP API, ledger, reconciliation
@@ -92,5 +102,5 @@ migrations          migration notes (actual SQL is embedded in internal/store)
 - Reservation expiry is swept every 10 seconds by default (`EXPIRY_INTERVAL`); ATP accounts for expired claims before the sweep runs.
 - The outbox relay ships events through a pluggable publisher; the bundled publisher only logs. A broker adapter is not included.
 - No authentication; tenancy is asserted by the `X-Tenant-ID` header and must be trusted at the edge.
-- No event replay/rebuild of positions from the log yet.
+- Replay verifies positions from movements; it does not rebuild cost layers or reservations from the event stream.
 - No partition/sharding for hot rows yet; correctness is proven before throughput optimization.

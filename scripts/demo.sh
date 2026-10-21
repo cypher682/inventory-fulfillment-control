@@ -123,4 +123,10 @@ get "/v1/positions/$LOC_A/$FIFO_SKU" | pretty
 get "/v1/audit/cost-consumptions?ref_type=reservation&ref_id=$FIFO_RESERVATION_ID" | pretty
 
 echo
+echo "16. replay: rebuild positions from movements"
+REPLAY=$(get "/v1/audit/replay")
+echo "$REPLAY" | pretty
+printf '%s' "$REPLAY" | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["ok"], r["issues"]'
+
+echo
 echo "done: tenant $TENANT"

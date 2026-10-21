@@ -321,6 +321,19 @@ func TestHTTPAdjustmentsAuditAndExpiry(t *testing.T) {
 		t.Fatalf("invalid layer_id status = %d, want 400", resp.StatusCode)
 	}
 
+	resp = doRequest(t, client, http.MethodGet, server.URL+"/v1/audit/replay", tenant, "", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("replay status = %d, body = %s", resp.StatusCode, readAll(t, resp))
+	}
+	replay := decodeBody[ReplayReport](t, resp)
+	if !replay.OK || replay.MovementCount != 2 || len(replay.Positions) != 1 {
+		t.Fatalf("replay = %+v", replay)
+	}
+	if p := replay.Positions[0]; p.ReplayedOnHand != 7 || p.RecordedOnHand != 7 ||
+		p.ReplayedValueCents != 1750 || p.RecordedValueCents != 1750 {
+		t.Fatalf("replay position = %+v", p)
+	}
+
 	resp = doRequest(t, client, http.MethodGet, server.URL+"/v1/audit/events?limit=201", tenant, "", "")
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("invalid limit status = %d, want 400", resp.StatusCode)

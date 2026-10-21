@@ -82,6 +82,12 @@ A transfer consumes source layers and writes the same chunks to `transfer_layers
 
 One row per position, locked with `SELECT ... FOR UPDATE`, then updated under `reserved <= on_hand`. This is correct and measurable. The concurrency test and `cmd/loadtest` are the gate before introducing partitioning, sharded counters, or per-SKU queues.
 
+## Replay verifier
+
+`Replay` reads the tenant's movements and positions in one repeatable-read snapshot, groups movements by `(location, sku)`, and compares `SUM(quantity_delta)` and `SUM(value_delta_cents)` with the materialized position. The report keeps replayed and recorded values side by side and lists drift, movements without a position, and positions without movements. It is read-only and is exposed as `GET /v1/audit/replay` and `cmd/replay -tenant <id>`.
+
+This verifies the position projection, not the whole event-sourced history: cost layers and reservations remain materialized state and are covered by reconciliation.
+
 ## Invariants checked by reconciliation
 
 1. `on_hand` = sum of quantity movements = sum of remaining layer quantity.
@@ -106,7 +112,7 @@ One row per position, locked with `SELECT ... FOR UPDATE`, then updated under `r
 
 ## Not implemented yet
 
-- Event replay/rebuild of positions from the log.
+- Full projection rebuild from `inventory_events` (replay currently uses the movement log).
 - Broker-backed outbox publisher.
 - Authentication and authorization.
 - Lot/serial tracking, quality holds, and LIFO/specific identification.

@@ -119,6 +119,16 @@ Checks:
 
 Returns `409` when `ok` is false.
 
+### GET /v1/audit/replay
+
+Rebuilds each position from the tenant's movement log and compares it with the stored position. Read-only; uses a repeatable-read snapshot.
+
+```json
+{"ok":true,"tenant":"demo","positions":[{"location_id":"wh-a","sku":"sku-1","movement_count":5,"replayed_on_hand":4,"replayed_value_cents":400,"recorded_on_hand":4,"recorded_value_cents":400,"has_position":true}],"issues":[],"movement_count":5,"checked_at":"2026-10-21T12:00:00Z"}
+```
+
+Drift, movements without a position, and positions without movements appear in `issues`. Returns `409` when `ok` is false.
+
 ### GET /v1/audit/events
 
 Pages through the tenant's event log. Filters: `aggregate_type`, `aggregate_id`, `event_type`, `after`, `limit`.

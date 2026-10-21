@@ -54,6 +54,7 @@ Prove the core inventory invariant end to end before adding scale mechanics:
 | `TestFIFOTransferPreservesLayerCosts` | transferred layers keep their cost and acquisition order at the destination |
 | `TestFIFONegativeAdjustmentUsesOldestLayers` | write-offs consume FIFO and preserve the sub-ledger |
 | `TestConcurrentConfirmationsConsumeFIFOExactly` | 100 concurrent confirms consume the layers exactly once and balance COGS |
+| `TestReplayRebuildsPositionsFromMovementLog` | replayed quantity/value match positions and drift is detected |
 | `TestAuditQueriesAreTenantScopedAndPaginated` | audit pages are ordered, filtered, and isolated per tenant |
 | `TestOutboxRelayPublishesAndRetries` | relay marks success, records failures, and retries |
 | `TestTenantIsolation` | reads from another tenant cannot see a position or reservation |
@@ -68,13 +69,13 @@ Prove the core inventory invariant end to end before adding scale mechanics:
 - Migration `0003` backfills one synthetic layer per existing position; pre-FIFO history did not preserve layer identity.
 - One database, one write path. Hot-SKU partitioning and sharded counters are deferred until the load test demands them.
 - The outbox relay is broker-agnostic but ships with a log publisher; no broker adapter is included.
-- No event replay/rebuild of positions from the log yet.
+- Replay rebuilds positions from movements, not the full event stream; cost layers and reservations are verified by reconciliation instead.
 - No negative-stock backorders, lot tracking, serials, quality holds, or LIFO/specific identification in this MVP.
 
 ## Next milestones
 
-1. Rebuild positions from the event log and verify against snapshots.
-2. Broker-backed outbox publisher (Kafka/NATS) with consumer examples.
-3. Authentication and signed internal service identity.
-4. Partitioning strategy for hot `(tenant, location, sku)` rows.
-5. Lot/serial tracking and quality holds layered on top of FIFO.
+1. Broker-backed outbox publisher (Kafka/NATS) with consumer examples.
+2. Authentication and signed internal service identity.
+3. Partitioning strategy for hot `(tenant, location, sku)` rows.
+4. Lot/serial tracking and quality holds layered on top of FIFO.
+5. Full projection rebuild from `inventory_events`.
