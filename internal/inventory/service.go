@@ -561,20 +561,31 @@ func (s *Service) reserveTx(ctx context.Context, tx pgx.Tx, tenant, actor string
 		return Reservation{}, &ValidationError{Field: "ttl_seconds", Message: "must be <= 604800"}
 	}
 
-	p, err := s.lockPosition(ctx, tx, tenant, in.LocationID, in.SKU)
-	if err != nil {
-		return Reservation{}, err
-	}
-	if p.Available < in.Quantity {
-		return Reservation{}, fmt.Errorf("%w: available=%d requested=%d", ErrInsufficientStock, p.Available, in.Quantity)
-	}
-
-	if _, err := tx.Exec(ctx,
+	var reserved int64
+	err := tx.QueryRow(ctx,
 		`UPDATE positions
 		 SET reserved = reserved + $4, version = version + 1, updated_at = now()
-		 WHERE tenant_id = $1 AND location_id = $2 AND sku = $3`,
+		 WHERE tenant_id = $1 AND location_id = $2 AND sku = $3
+		   AND on_hand - reserved >= $4
+		 RETURNING reserved`,
 		tenant, in.LocationID, in.SKU, in.Quantity,
-	); err != nil {
+	).Scan(&reserved)
+	if errors.Is(err, pgx.ErrNoRows) {
+		var available int64
+		err := tx.QueryRow(ctx,
+			`SELECT on_hand - reserved FROM positions
+			 WHERE tenant_id = $1 AND location_id = $2 AND sku = $3`,
+			tenant, in.LocationID, in.SKU,
+		).Scan(&available)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Reservation{}, fmt.Errorf("%w: position %s/%s", ErrNotFound, in.LocationID, in.SKU)
+		}
+		if err != nil {
+			return Reservation{}, err
+		}
+		return Reservation{}, fmt.Errorf("%w: available=%d requested=%d", ErrInsufficientStock, available, in.Quantity)
+	}
+	if err != nil {
 		return Reservation{}, err
 	}
 

@@ -4,7 +4,7 @@ High-scale inventory control plane for multi-location retailers, distributors, a
 
 ## Status
 
-v0.6 implemented on PostgreSQL, with optional NATS JetStream delivery. Correctness is enforced in the database transaction path and covered by integration tests, including concurrent oversell, expiry, and FIFO allocation tests.
+v0.7 implemented on PostgreSQL, with optional NATS JetStream delivery. Correctness is enforced in the database transaction path and covered by integration tests, including concurrent oversell, expiry, and FIFO allocation tests.
 
 | Stage | Scope | State |
 |-------|-------|-------|
@@ -17,11 +17,12 @@ v0.6 implemented on PostgreSQL, with optional NATS JetStream delivery. Correctne
 | 6 | Costing + inventory sub-ledger | done: FIFO cost layers + double-entry postings |
 | 7 | Load testing + observability | done: concurrency tests, load harness with percentiles, Prometheus counters/histograms |
 | 8 | Multi-tenant controls + audit queries | done: tenant isolation, optional API keys, paginated audit APIs |
+| 9 | Hot-key contention strategy | done: atomic reserve fast path, multi-SKU benchmark, capacity-lease design |
 
 ## What works
 
 - Receipts create positions and append FIFO cost layers.
-- Reservations decrement available stock under a row lock; concurrent orders cannot oversell.
+- Reservations decrement available stock with one conditional `UPDATE`; concurrent orders cannot oversell.
 - Confirm ships stock, consumes the oldest cost layers, releases the reservation, and posts a balanced journal entry.
 - Release restores availability. Expired reservations are released by a `SKIP LOCKED` sweeper, and ATP reports them as available immediately.
 - Transfers move quantity and value between locations through in-transit, preserving the consumed layers for destination FIFO.
@@ -40,6 +41,7 @@ v0.6 implemented on PostgreSQL, with optional NATS JetStream delivery. Correctne
 
 - [Architecture](docs/architecture.md)
 - [API reference](docs/api.md)
+- [Hot-key partitioning strategy](docs/partitioning.md)
 - [MVP scope and limits](docs/mvp.md)
 
 ## Quick start
@@ -90,9 +92,10 @@ Start the service, then:
 
 ```sh
 go run ./cmd/loadtest -stock 100 -attempts 500 -workers 64
+go run ./cmd/loadtest -stock 400 -attempts 1200 -workers 64 -skus 16
 ```
 
-The command seeds stock, fires concurrent reservations, prints p50/p95/p99 latency, and fails if more than the available stock is reserved or if reconciliation is not clean.
+The command seeds stock, fires concurrent reservations, prints p50/p95/p99 latency, and fails if more than the available stock is reserved or if reconciliation is not clean. `-skus` spreads the same total stock and attempts over multiple positions, which makes single-SKU contention comparable with a spread workload.
 
 ## Replay
 
@@ -123,7 +126,7 @@ internal/health     liveness/readiness
 internal/inventory  domain, HTTP API, ledger, reconciliation
 internal/store      connection + embedded migrations
 internal/outbox     outbox relay with leases, retries, NATS/webhook publishers
-docs                architecture, API, MVP scope
+docs                architecture, API, MVP scope, hot-key strategy
 deploy              local Postgres and NATS
 migrations          migration notes (actual SQL is embedded in internal/store)
 ```
@@ -136,4 +139,4 @@ migrations          migration notes (actual SQL is embedded in internal/store)
 - NATS delivery is at-least-once with a one-hour dedupe window; webhook delivery is at-least-once and relies on the receiver for idempotency. There is no dead-letter stream or schema registry.
 - API keys are static per-tenant secrets from `API_KEYS`; there is no rotation, scopes, or user identity. When auth is disabled, tenancy is asserted by `X-Tenant-ID` and must be trusted at the edge.
 - Replay verifies positions from movements; it does not rebuild cost layers or reservations from the event stream.
-- No partition/sharding for hot rows yet; correctness is proven before throughput optimization.
+- Hot rows still serialize on one position. `docs/partitioning.md` records the measured contention, the capacity-lease bucket design, and the gate for enabling it; sharded counters are not active yet.

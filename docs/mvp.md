@@ -68,14 +68,14 @@ Prove the core inventory invariant end to end before adding scale mechanics:
 | `TestReleaseRestoresAvailability` | release restores available quantity and blocks a later confirm |
 | `TestHTTPAdjustmentsAuditAndExpiry` | full API path for adjustments, audit, and expired confirm |
 
-`cmd/loadtest` repeats the oversell proof over HTTP, reports p50/p95/p99 latency, and checks reconciliation at the end.
+`cmd/loadtest` repeats the oversell proof over HTTP, reports p50/p95/p99 latency, and checks reconciliation at the end. The `-skus` flag spreads the same stock and attempt count across positions to compare a hot key with independent keys.
 
 ## Deliberate limits
 
 - FIFO costing with integer division; a partial layer floors, and a fully consumed layer takes its exact remaining value.
 - Migration `0003` backfills one synthetic layer per existing position; pre-FIFO history did not preserve layer identity.
-- One database, one write path. Hot-SKU partitioning and sharded counters are deferred until the load test demands them.
-- The outbox relay is broker-agnostic but ships with a log publisher; no broker adapter is included.
+- One database, one write path. Reservations use a single conditional update; the hot-key benchmark, capacity-lease design, and enablement gate are in `docs/partitioning.md`. Sharded counters are not active yet.
+- The outbox relay ships with log, NATS JetStream, and HMAC webhook publishers. NATS dedupes by outbox ID for one hour; webhooks rely on receiver idempotency.
 - Replay rebuilds positions from movements, not the full event stream; cost layers and reservations are verified by reconciliation instead.
 - API keys are static secrets with full tenant access; there is no rotation, scoped permission, or per-user identity.
 - Outbox delivery is at-least-once. NATS dedupes by outbox ID for one hour; webhook receivers must dedupe themselves. There is no dead-letter stream or schema registry.
@@ -83,8 +83,8 @@ Prove the core inventory invariant end to end before adding scale mechanics:
 
 ## Next milestones
 
-1. Key rotation, scoped permissions, and signed internal service identity.
-2. Partitioning strategy for hot `(tenant, location, sku)` rows.
-3. Lot/serial tracking and quality holds layered on top of FIFO.
+1. Lot/serial tracking and quality holds layered on top of FIFO.
+2. Bucket-based reservation partitioning for hot `(tenant, location, sku)` rows.
+3. Key rotation, scoped permissions, and signed internal service identity.
 4. Full projection rebuild from `inventory_events`.
 5. Dead-letter stream, consumer lag monitoring, and a schema registry.

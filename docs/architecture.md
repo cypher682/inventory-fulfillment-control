@@ -81,7 +81,7 @@ A transfer consumes source layers and writes the same chunks to `transfer_layers
 
 ## Hot-SKU strategy
 
-One row per position, locked with `SELECT ... FOR UPDATE`, then updated under `reserved <= on_hand`. This is correct and measurable. The concurrency test and `cmd/loadtest` are the gate before introducing partitioning, sharded counters, or per-SKU queues.
+Reservation uses one conditional `UPDATE` that increments `reserved` only when `on_hand - reserved >= quantity`. This removes the separate `SELECT ... FOR UPDATE` round trip while keeping the row as the correctness boundary. `cmd/loadtest -skus` measures single-row contention against a spread workload; the results and the approved capacity-lease bucket design are in [partitioning.md](partitioning.md). Sharded counters are not enabled yet.
 
 ## Replay verifier
 
@@ -133,4 +133,4 @@ The relay claims a batch under a 30s lease, publishes each envelope, marks succe
 - Dead-letter stream, consumer lag monitoring, and a schema registry.
 - Key rotation, scoped authorization, and user identity.
 - Lot/serial tracking, quality holds, and LIFO/specific identification.
-- Partitioning for extreme hot-key contention.
+- Bucket-based reservation partitioning for extreme hot-key contention; the design and migration plan are documented but not enabled.

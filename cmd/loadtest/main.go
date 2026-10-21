@@ -19,6 +19,7 @@ type config struct {
 	tenant      string
 	location    string
 	sku         string
+	skus        int
 	stock       int64
 	attempts    int64
 	workers     int
@@ -41,8 +42,9 @@ func main() {
 	flag.StringVar(&cfg.base, "base", "http://localhost:8092", "service base URL")
 	flag.StringVar(&cfg.tenant, "tenant", "", "tenant id (default: generated)")
 	flag.StringVar(&cfg.location, "location", "load-loc", "location id")
-	flag.StringVar(&cfg.sku, "sku", "load-sku", "sku")
-	flag.Int64Var(&cfg.stock, "stock", 100, "units to seed")
+	flag.StringVar(&cfg.sku, "sku", "load-sku", "sku prefix")
+	flag.IntVar(&cfg.skus, "skus", 1, "number of SKUs to spread attempts across")
+	flag.Int64Var(&cfg.stock, "stock", 100, "total units to seed across all SKUs")
 	flag.Int64Var(&cfg.attempts, "attempts", 300, "reservation attempts")
 	flag.IntVar(&cfg.workers, "workers", 64, "concurrent workers")
 	flag.BoolVar(&cfg.idempotency, "idempotency", false, "send a unique idempotency key per attempt")
@@ -58,20 +60,43 @@ func main() {
 }
 
 func run(cfg config) error {
+	if cfg.skus < 1 {
+		return fmt.Errorf("skus must be >= 1")
+	}
+	if cfg.stock < int64(cfg.skus) {
+		return fmt.Errorf("stock (%d) must be >= skus (%d)", cfg.stock, cfg.skus)
+	}
+	if cfg.attempts < cfg.stock {
+		return fmt.Errorf("attempts (%d) must be >= stock (%d)", cfg.attempts, cfg.stock)
+	}
 	client := &http.Client{Timeout: 15 * time.Second}
 
-	receipt := map[string]any{
-		"location_id":     cfg.location,
-		"sku":             cfg.sku,
-		"quantity":        cfg.stock,
-		"unit_cost_cents": 100,
-	}
-	status, body, err := do(client, cfg, http.MethodPost, "/v1/receipts", receipt, "seed")
-	if err != nil {
-		return err
-	}
-	if status != http.StatusCreated {
-		return fmt.Errorf("seed receipt: status=%d body=%s", status, body)
+	skus := make([]string, cfg.skus)
+	seeded := make([]int64, cfg.skus)
+	perSKU := cfg.stock / int64(cfg.skus)
+	remainder := cfg.stock % int64(cfg.skus)
+	for i := range skus {
+		skus[i] = cfg.sku
+		if cfg.skus > 1 {
+			skus[i] = fmt.Sprintf("%s-%02d", cfg.sku, i)
+		}
+		seeded[i] = perSKU
+		if int64(i) < remainder {
+			seeded[i]++
+		}
+		receipt := map[string]any{
+			"location_id":     cfg.location,
+			"sku":             skus[i],
+			"quantity":        seeded[i],
+			"unit_cost_cents": 100,
+		}
+		status, body, err := do(client, cfg, http.MethodPost, "/v1/receipts", receipt, "seed-"+skus[i])
+		if err != nil {
+			return err
+		}
+		if status != http.StatusCreated {
+			return fmt.Errorf("seed receipt for %s: status=%d body=%s", skus[i], status, body)
+		}
 	}
 
 	var success, insufficient, failed atomic.Int64
@@ -93,24 +118,25 @@ func run(cfg config) error {
 				if cfg.idempotency {
 					key = fmt.Sprintf("attempt-%d", n)
 				}
+				sku := skus[(n-1)%int64(len(skus))]
 				requestStart := time.Now()
 				status, body, err := do(client, cfg, http.MethodPost, "/v1/reservations", map[string]any{
 					"location_id": cfg.location,
-					"sku":         cfg.sku,
+					"sku":         sku,
 					"quantity":    1,
 				}, key)
 				durations[n-1] = time.Since(requestStart)
 				switch {
 				case err != nil:
 					failed.Add(1)
-					fmt.Fprintf(os.Stderr, "attempt %d: %v\n", n, err)
+					fmt.Fprintf(os.Stderr, "attempt %d (%s): %v\n", n, sku, err)
 				case status == http.StatusCreated:
 					success.Add(1)
 				case status == http.StatusConflict:
 					insufficient.Add(1)
 				default:
 					failed.Add(1)
-					fmt.Fprintf(os.Stderr, "attempt %d: status=%d body=%s\n", n, status, body)
+					fmt.Fprintf(os.Stderr, "attempt %d (%s): status=%d body=%s\n", n, sku, status, body)
 				}
 			}
 		}()
@@ -118,10 +144,6 @@ func run(cfg config) error {
 	wg.Wait()
 	elapsed := time.Since(start)
 
-	var p position
-	if err := get(client, cfg, "/v1/positions/"+cfg.location+"/"+cfg.sku, &p); err != nil {
-		return err
-	}
 	var report reconciliation
 	if err := get(client, cfg, "/v1/reconciliation", &report); err != nil {
 		return err
@@ -129,12 +151,11 @@ func run(cfg config) error {
 
 	rate := float64(cfg.attempts) / elapsed.Seconds()
 	sort.Slice(durations, func(i, j int) bool { return durations[i] < durations[j] })
-	fmt.Printf("tenant=%s attempts=%d workers=%d\n", cfg.tenant, cfg.attempts, cfg.workers)
+	fmt.Printf("tenant=%s attempts=%d workers=%d skus=%d stock=%d\n", cfg.tenant, cfg.attempts, cfg.workers, cfg.skus, cfg.stock)
 	fmt.Printf("success=%d rejected=%d errors=%d in %s (%.1f req/s)\n",
 		success.Load(), insufficient.Load(), failed.Load(), elapsed.Round(time.Millisecond), rate)
 	fmt.Printf("latency: p50=%s p95=%s p99=%s max=%s\n",
 		percentile(durations, 0.50), percentile(durations, 0.95), percentile(durations, 0.99), percentile(durations, 1))
-	fmt.Printf("position: on_hand=%d reserved=%d available=%d\n", p.OnHand, p.Reserved, p.Available)
 	fmt.Printf("reconciliation: ok=%v issues=%v\n", report.OK, report.Issues)
 
 	if failed.Load() > 0 {
@@ -143,8 +164,15 @@ func run(cfg config) error {
 	if success.Load() != cfg.stock {
 		return fmt.Errorf("sold %d reservations against %d units of stock", success.Load(), cfg.stock)
 	}
-	if p.Reserved != cfg.stock || p.Available != 0 {
-		return fmt.Errorf("position invariant violated: %+v", p)
+	for i, sku := range skus {
+		var p position
+		if err := get(client, cfg, "/v1/positions/"+cfg.location+"/"+sku, &p); err != nil {
+			return err
+		}
+		if p.OnHand != seeded[i] || p.Reserved != seeded[i] || p.Available != 0 {
+			return fmt.Errorf("position %s invariant violated: on_hand=%d reserved=%d available=%d want on_hand=reserved=%d",
+				sku, p.OnHand, p.Reserved, p.Available, seeded[i])
+		}
 	}
 	if !report.OK {
 		return fmt.Errorf("reconciliation failed: %v", report.Issues)
