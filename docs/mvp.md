@@ -11,18 +11,18 @@ Prove the core inventory invariant end to end before adding scale mechanics:
 | Capability | Implementation |
 |------------|----------------|
 | Multi-tenant positions | `positions` keyed by `(tenant, location, sku)` |
-| Receipts | append movement, add value at unit cost |
+| Receipts | append movement and a FIFO cost layer |
 | Reservations | `SELECT ... FOR UPDATE` + conditional availability check |
 | Expiry | `SKIP LOCKED` sweeper releases expired reservations; confirm rejects them |
 | Release | restore reserved quantity |
-| Confirm / ship | decrement on-hand + reserved, post COGS vs inventory |
-| Transfers | source out, in-transit value, destination in |
-| Adjustments | signed quantity change with a required reason; cycle-count corrections |
+| Confirm / ship | consume oldest layers, decrement on-hand + reserved, post COGS vs inventory |
+| Transfers | consume source layers, stage them in transit, recreate at destination |
+| Adjustments | signed quantity change with a required reason; negative deltas consume FIFO |
 | ATP | available = on-hand - reserved + expired-not-yet-swept; incoming in-transit |
 | Idempotency | `idempotency_keys`, request hash, stored response |
 | Events | append-only `inventory_events` + relay-ready outbox in the same transaction |
-| Audit | paginated events, movements, and ledger queries per tenant |
-| Reconciliation | snapshot-consistent check over movements, reservations, ledger, transfers |
+| Audit | paginated events, movements, ledger, cost layers, and consumptions per tenant |
+| Reconciliation | snapshot-consistent check over movements, layers, reservations, ledger, transfers |
 | Authn/authz | intentionally out of scope; tenant header is trusted |
 
 ## Invariants
@@ -31,12 +31,13 @@ Prove the core inventory invariant end to end before adding scale mechanics:
 2. A reservation succeeds only if the available quantity was sufficient at commit time.
 3. Releasing or confirming a reservation changes `reserved` exactly once.
 4. Every movement with financial impact posts debit and credit entries of equal value.
-5. `on_hand` equals the sum of quantity movements for the position.
-6. `inventory_value_cents` equals the `inventory` ledger balance for the position.
-7. In-transit ledger balance equals the value of transfers still in transit.
+5. `on_hand` equals the sum of quantity movements and the sum of remaining layer quantities.
+6. `inventory_value_cents` equals the `inventory` ledger balance and the sum of remaining layer values.
+7. In-transit ledger balance equals the value of transfers still in transit and their pending layer value.
 8. A replayed idempotency key returns the original response and never re-applies effects.
 9. An expired reservation cannot be confirmed; its reserved quantity is restored exactly once.
 10. An adjustment cannot consume quantity that is reserved for an active order.
+11. A ship or transfer consumes the oldest layers first; consuming a full layer takes its exact remaining value.
 
 ## Evidence
 
@@ -49,6 +50,10 @@ Prove the core inventory invariant end to end before adding scale mechanics:
 | `TestExpireReservationsRestoresStock` | expired stock is released once and cannot be confirmed |
 | `TestATPReportsExpiredReservations` | ATP ignores expired claims before the sweeper runs |
 | `TestAdjustmentsPreserveValueAndLedger` | gains/losses balance, respect reservations, and replay safely |
+| `TestFIFOConfirmConsumesOldestLayers` | COGS follows receipt order and leaves the correct remaining layer |
+| `TestFIFOTransferPreservesLayerCosts` | transferred layers keep their cost and acquisition order at the destination |
+| `TestFIFONegativeAdjustmentUsesOldestLayers` | write-offs consume FIFO and preserve the sub-ledger |
+| `TestConcurrentConfirmationsConsumeFIFOExactly` | 100 concurrent confirms consume the layers exactly once and balance COGS |
 | `TestAuditQueriesAreTenantScopedAndPaginated` | audit pages are ordered, filtered, and isolated per tenant |
 | `TestOutboxRelayPublishesAndRetries` | relay marks success, records failures, and retries |
 | `TestTenantIsolation` | reads from another tenant cannot see a position or reservation |
@@ -59,16 +64,17 @@ Prove the core inventory invariant end to end before adding scale mechanics:
 
 ## Deliberate limits
 
-- Moving-value costing with integer division; long-tail rounding is absorbed into the last unit.
+- FIFO costing with integer division; a partial layer floors, and a fully consumed layer takes its exact remaining value.
+- Migration `0003` backfills one synthetic layer per existing position; pre-FIFO history did not preserve layer identity.
 - One database, one write path. Hot-SKU partitioning and sharded counters are deferred until the load test demands them.
 - The outbox relay is broker-agnostic but ships with a log publisher; no broker adapter is included.
 - No event replay/rebuild of positions from the log yet.
-- No negative-stock backorders, lot tracking, serials, or quality holds in this MVP.
+- No negative-stock backorders, lot tracking, serials, quality holds, or LIFO/specific identification in this MVP.
 
 ## Next milestones
 
-1. FIFO cost layers and per-layer valuation.
-2. Rebuild positions from the event log and verify against snapshots.
-3. Broker-backed outbox publisher (Kafka/NATS) with consumer examples.
-4. Authentication and signed internal service identity.
-5. Partitioning strategy for hot `(tenant, location, sku)` rows.
+1. Rebuild positions from the event log and verify against snapshots.
+2. Broker-backed outbox publisher (Kafka/NATS) with consumer examples.
+3. Authentication and signed internal service identity.
+4. Partitioning strategy for hot `(tenant, location, sku)` rows.
+5. Lot/serial tracking and quality holds layered on top of FIFO.

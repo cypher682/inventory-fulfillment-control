@@ -133,6 +133,31 @@ type LedgerEntry struct {
 	CreatedAt   time.Time `json:"created_at"`
 }
 
+type CostLayer struct {
+	ID                  int64     `json:"id"`
+	LocationID          string    `json:"location_id"`
+	SKU                 string    `json:"sku"`
+	OriginalQuantity    int64     `json:"original_quantity"`
+	RemainingQuantity   int64     `json:"remaining_quantity"`
+	OriginalValueCents  int64     `json:"original_value_cents"`
+	RemainingValueCents int64     `json:"remaining_value_cents"`
+	ReceivedAt          time.Time `json:"received_at"`
+	SourceType          string    `json:"source_type"`
+	SourceID            string    `json:"source_id"`
+}
+
+type CostConsumption struct {
+	ID         int64     `json:"id"`
+	LayerID    int64     `json:"layer_id"`
+	LocationID string    `json:"location_id"`
+	SKU        string    `json:"sku"`
+	Quantity   int64     `json:"quantity"`
+	ValueCents int64     `json:"value_cents"`
+	RefType    string    `json:"ref_type"`
+	RefID      string    `json:"ref_id"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
 type EventFilter struct {
 	AggregateType string
 	AggregateID   string
@@ -159,6 +184,24 @@ type LedgerFilter struct {
 	Limit      int
 }
 
+type CostLayerFilter struct {
+	LocationID   string
+	SKU          string
+	IncludeEmpty bool
+	After        int64
+	Limit        int
+}
+
+type CostConsumptionFilter struct {
+	LayerID    int64
+	LocationID string
+	SKU        string
+	RefType    string
+	RefID      string
+	After      int64
+	Limit      int
+}
+
 type EventPage struct {
 	Events    []Event `json:"events"`
 	NextAfter int64   `json:"next_after"`
@@ -175,4 +218,16 @@ type LedgerPage struct {
 	Entries   []LedgerEntry `json:"entries"`
 	NextAfter int64         `json:"next_after"`
 	HasMore   bool          `json:"has_more"`
+}
+
+type CostLayerPage struct {
+	Layers    []CostLayer `json:"layers"`
+	NextAfter int64       `json:"next_after"`
+	HasMore   bool        `json:"has_more"`
+}
+
+type CostConsumptionPage struct {
+	Consumptions []CostConsumption `json:"consumptions"`
+	NextAfter    int64             `json:"next_after"`
+	HasMore      bool              `json:"has_more"`
 }

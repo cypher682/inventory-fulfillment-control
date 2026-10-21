@@ -172,6 +172,119 @@ func (s *Service) ListLedger(ctx context.Context, tenant string, f LedgerFilter)
 	return page, nil
 }
 
+func (s *Service) ListCostLayers(ctx context.Context, tenant string, f CostLayerFilter) (CostLayerPage, error) {
+	if err := validateID("tenant", tenant); err != nil {
+		return CostLayerPage{}, err
+	}
+	if err := validateAuditFilter(f.LocationID, f.SKU); err != nil {
+		return CostLayerPage{}, err
+	}
+	limit := auditLimit(f.Limit)
+	args := []any{tenant, auditAfter(f.After)}
+	where := "tenant_id = $1 AND id > $2"
+	addFilter(&where, &args, "location_id", f.LocationID)
+	addFilter(&where, &args, "sku", f.SKU)
+	if !f.IncludeEmpty {
+		where += " AND remaining_quantity > 0"
+	}
+	args = append(args, limit+1)
+
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, location_id, sku, original_quantity, remaining_quantity,
+		        original_value_cents, remaining_value_cents, received_at, source_type, source_id
+		 FROM cost_layers
+		 WHERE `+where+`
+		 ORDER BY id
+		 LIMIT $`+fmt.Sprint(len(args)),
+		args...,
+	)
+	if err != nil {
+		return CostLayerPage{}, err
+	}
+	defer rows.Close()
+
+	layers := make([]CostLayer, 0, limit+1)
+	for rows.Next() {
+		var l CostLayer
+		if err := rows.Scan(&l.ID, &l.LocationID, &l.SKU, &l.OriginalQuantity, &l.RemainingQuantity,
+			&l.OriginalValueCents, &l.RemainingValueCents, &l.ReceivedAt, &l.SourceType, &l.SourceID); err != nil {
+			return CostLayerPage{}, err
+		}
+		layers = append(layers, l)
+	}
+	if err := rows.Err(); err != nil {
+		return CostLayerPage{}, err
+	}
+
+	page := CostLayerPage{Layers: layers}
+	if len(layers) > limit {
+		page.HasMore = true
+		page.NextAfter = layers[limit-1].ID
+		page.Layers = layers[:limit]
+	}
+	s.metrics.auditReads.Add(1)
+	return page, nil
+}
+
+func (s *Service) ListCostConsumptions(ctx context.Context, tenant string, f CostConsumptionFilter) (CostConsumptionPage, error) {
+	if err := validateID("tenant", tenant); err != nil {
+		return CostConsumptionPage{}, err
+	}
+	if f.LayerID < 0 {
+		return CostConsumptionPage{}, &ValidationError{Field: "layer_id", Message: "must be positive"}
+	}
+	if err := validateAuditFilter(f.LocationID, f.SKU, f.RefType, f.RefID); err != nil {
+		return CostConsumptionPage{}, err
+	}
+	limit := auditLimit(f.Limit)
+	args := []any{tenant, auditAfter(f.After)}
+	where := "tenant_id = $1 AND id > $2"
+	addFilter(&where, &args, "location_id", f.LocationID)
+	addFilter(&where, &args, "sku", f.SKU)
+	addFilter(&where, &args, "ref_type", f.RefType)
+	addFilter(&where, &args, "ref_id", f.RefID)
+	if f.LayerID > 0 {
+		args = append(args, f.LayerID)
+		where += fmt.Sprintf(" AND layer_id = $%d", len(args))
+	}
+	args = append(args, limit+1)
+
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, layer_id, location_id, sku, quantity, value_cents, ref_type, ref_id, created_at
+		 FROM cost_consumptions
+		 WHERE `+where+`
+		 ORDER BY id
+		 LIMIT $`+fmt.Sprint(len(args)),
+		args...,
+	)
+	if err != nil {
+		return CostConsumptionPage{}, err
+	}
+	defer rows.Close()
+
+	consumptions := make([]CostConsumption, 0, limit+1)
+	for rows.Next() {
+		var c CostConsumption
+		if err := rows.Scan(&c.ID, &c.LayerID, &c.LocationID, &c.SKU, &c.Quantity,
+			&c.ValueCents, &c.RefType, &c.RefID, &c.CreatedAt); err != nil {
+			return CostConsumptionPage{}, err
+		}
+		consumptions = append(consumptions, c)
+	}
+	if err := rows.Err(); err != nil {
+		return CostConsumptionPage{}, err
+	}
+
+	page := CostConsumptionPage{Consumptions: consumptions}
+	if len(consumptions) > limit {
+		page.HasMore = true
+		page.NextAfter = consumptions[limit-1].ID
+		page.Consumptions = consumptions[:limit]
+	}
+	s.metrics.auditReads.Add(1)
+	return page, nil
+}
+
 func addFilter(where *string, args *[]any, column, value string) {
 	if value == "" {
 		return

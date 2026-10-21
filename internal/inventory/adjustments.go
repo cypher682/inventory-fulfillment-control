@@ -69,9 +69,15 @@ func (s *Service) adjustTx(ctx context.Context, tx pgx.Tx, tenant, actor string,
 		return Adjustment{}, err
 	}
 
+	id, err := newID()
+	if err != nil {
+		return Adjustment{}, err
+	}
+
 	var (
 		position Position
 		value    int64
+		costUses []layerUse
 	)
 	if in.QuantityDelta > 0 {
 		value = in.QuantityDelta * in.UnitCostCents
@@ -89,6 +95,9 @@ func (s *Service) adjustTx(ctx context.Context, tx pgx.Tx, tenant, actor string,
 			&position.InventoryValueCents, &position.Version, &position.UpdatedAt); err != nil {
 			return Adjustment{}, err
 		}
+		if err := s.createCostLayer(ctx, tx, tenant, in.LocationID, in.SKU, in.QuantityDelta, value, s.clock(), "adjustment", id); err != nil {
+			return Adjustment{}, err
+		}
 	} else {
 		locked, err := s.lockPosition(ctx, tx, tenant, in.LocationID, in.SKU)
 		if err != nil {
@@ -98,9 +107,12 @@ func (s *Service) adjustTx(ctx context.Context, tx pgx.Tx, tenant, actor string,
 			return Adjustment{}, fmt.Errorf("%w: available=%d requested=%d", ErrInsufficientStock, locked.Available, quantity)
 		}
 
-		value = locked.InventoryValueCents * quantity / locked.OnHand
-		if quantity == locked.OnHand {
-			value = locked.InventoryValueCents
+		costUses, value, err = s.consumeFIFO(ctx, tx, tenant, in.LocationID, in.SKU, quantity)
+		if err != nil {
+			return Adjustment{}, err
+		}
+		if err := s.recordConsumptions(ctx, tx, tenant, in.LocationID, in.SKU, costUses, "adjustment", id); err != nil {
+			return Adjustment{}, err
 		}
 
 		if err := tx.QueryRow(ctx,
@@ -119,10 +131,6 @@ func (s *Service) adjustTx(ctx context.Context, tx pgx.Tx, tenant, actor string,
 	}
 	position.Available = position.OnHand - position.Reserved
 
-	id, err := newID()
-	if err != nil {
-		return Adjustment{}, err
-	}
 	signedValue := value
 	if in.QuantityDelta < 0 {
 		signedValue = -value
@@ -163,6 +171,7 @@ func (s *Service) adjustTx(ctx context.Context, tx pgx.Tx, tenant, actor string,
 		"reason":            reason,
 		"on_hand":           position.OnHand,
 		"inventory_value":   position.InventoryValueCents,
+		"cost_layers":       costLayerPayload(costUses),
 	}); err != nil {
 		return Adjustment{}, err
 	}

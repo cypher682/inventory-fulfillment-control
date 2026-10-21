@@ -225,27 +225,34 @@ func (s *Service) Reconcile(ctx context.Context, tenant string) (Reconciliation,
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	movementRows, err := tx.Query(ctx,
-		`SELECT p.location_id, p.sku, p.on_hand, COALESCE(m.qty, 0)
+		`SELECT p.location_id, p.sku, p.on_hand, p.inventory_value_cents,
+		        COALESCE(m.qty, 0), COALESCE(m.value_cents, 0)
 		 FROM positions p
 		 LEFT JOIN (
-			SELECT location_id, sku, SUM(quantity_delta) AS qty
+			SELECT location_id, sku,
+			       SUM(quantity_delta) AS qty,
+			       SUM(value_delta_cents) AS value_cents
 			FROM inventory_movements
 			WHERE tenant_id = $1
 			GROUP BY location_id, sku
 		 ) m ON m.location_id = p.location_id AND m.sku = p.sku
-		 WHERE p.tenant_id = $1 AND p.on_hand <> COALESCE(m.qty, 0)
+		 WHERE p.tenant_id = $1
+		   AND (p.on_hand <> COALESCE(m.qty, 0)
+		        OR p.inventory_value_cents <> COALESCE(m.value_cents, 0))
 		 ORDER BY p.location_id, p.sku`, tenant)
 	if err != nil {
 		return Reconciliation{}, err
 	}
 	for movementRows.Next() {
 		var loc, sku string
-		var onHand, moved int64
-		if err := movementRows.Scan(&loc, &sku, &onHand, &moved); err != nil {
+		var onHand, positionValue, moved, movedValue int64
+		if err := movementRows.Scan(&loc, &sku, &onHand, &positionValue, &moved, &movedValue); err != nil {
 			movementRows.Close()
 			return Reconciliation{}, err
 		}
-		issues = append(issues, fmt.Sprintf("position %s/%s on_hand=%d but movements=%d", loc, sku, onHand, moved))
+		issues = append(issues, fmt.Sprintf(
+			"position %s/%s on_hand=%d value=%d but movements quantity=%d value=%d",
+			loc, sku, onHand, positionValue, moved, movedValue))
 	}
 	movementRows.Close()
 	if err := movementRows.Err(); err != nil {
@@ -319,17 +326,60 @@ func (s *Service) Reconcile(ctx context.Context, tenant string) (Reconciliation,
 		return Reconciliation{}, err
 	}
 
-	var transferValue, transitLedger int64
+	layerRows, err := tx.Query(ctx,
+		`SELECT p.location_id, p.sku, p.on_hand, p.inventory_value_cents,
+		        COALESCE(l.quantity, 0), COALESCE(l.value_cents, 0)
+		 FROM positions p
+		 LEFT JOIN (
+			SELECT location_id, sku,
+			       SUM(remaining_quantity) AS quantity,
+			       SUM(remaining_value_cents) AS value_cents
+			FROM cost_layers
+			WHERE tenant_id = $1
+			GROUP BY location_id, sku
+		 ) l ON l.location_id = p.location_id AND l.sku = p.sku
+		 WHERE p.tenant_id = $1
+		   AND (p.on_hand <> COALESCE(l.quantity, 0)
+		        OR p.inventory_value_cents <> COALESCE(l.value_cents, 0))
+		 ORDER BY p.location_id, p.sku`, tenant)
+	if err != nil {
+		return Reconciliation{}, err
+	}
+	for layerRows.Next() {
+		var loc, sku string
+		var onHand, positionValue, layerQuantity, layerValue int64
+		if err := layerRows.Scan(&loc, &sku, &onHand, &positionValue, &layerQuantity, &layerValue); err != nil {
+			layerRows.Close()
+			return Reconciliation{}, err
+		}
+		issues = append(issues, fmt.Sprintf(
+			"position %s/%s on_hand=%d value=%d but cost layers quantity=%d value=%d",
+			loc, sku, onHand, positionValue, layerQuantity, layerValue))
+	}
+	layerRows.Close()
+	if err := layerRows.Err(); err != nil {
+		return Reconciliation{}, err
+	}
+
+	var transferValue, transitLedger, pendingLayerValue, pendingLayerQuantity, transferQuantity int64
 	if err := tx.QueryRow(ctx,
 		`SELECT
 			COALESCE((SELECT SUM(value_cents) FROM transfers WHERE tenant_id = $1 AND status = 'in_transit'), 0),
-			COALESCE((SELECT SUM(debit_cents - credit_cents) FROM ledger_entries WHERE tenant_id = $1 AND account = 'inventory_in_transit'), 0)`,
+			COALESCE((SELECT SUM(debit_cents - credit_cents) FROM ledger_entries WHERE tenant_id = $1 AND account = 'inventory_in_transit'), 0),
+			COALESCE((SELECT SUM(value_cents) FROM transfer_layers WHERE tenant_id = $1 AND settled_at IS NULL), 0),
+			COALESCE((SELECT SUM(quantity) FROM transfer_layers WHERE tenant_id = $1 AND settled_at IS NULL), 0),
+			COALESCE((SELECT SUM(quantity) FROM transfers WHERE tenant_id = $1 AND status = 'in_transit'), 0)`,
 		tenant,
-	).Scan(&transferValue, &transitLedger); err != nil {
+	).Scan(&transferValue, &transitLedger, &pendingLayerValue, &pendingLayerQuantity, &transferQuantity); err != nil {
 		return Reconciliation{}, err
 	}
 	if transferValue != transitLedger {
 		issues = append(issues, fmt.Sprintf("in-transit value=%d but ledger=%d", transferValue, transitLedger))
+	}
+	if transferValue != pendingLayerValue || transferQuantity != pendingLayerQuantity {
+		issues = append(issues, fmt.Sprintf(
+			"in-transit transfers quantity=%d value=%d but pending transfer layers quantity=%d value=%d",
+			transferQuantity, transferValue, pendingLayerQuantity, pendingLayerValue))
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -469,6 +519,9 @@ func (s *Service) receiveTx(ctx context.Context, tx pgx.Tx, tenant, actor string
 	if err != nil {
 		return Position{}, err
 	}
+	if err := s.createCostLayer(ctx, tx, tenant, p.LocationID, p.SKU, in.Quantity, value, s.clock(), "receipt", receiptID); err != nil {
+		return Position{}, err
+	}
 	if err := s.recordMovement(ctx, tx, tenant, p.LocationID, p.SKU, "receive", in.Quantity, value, "receipt", receiptID); err != nil {
 		return Position{}, err
 	}
@@ -577,9 +630,12 @@ func (s *Service) confirmTx(ctx context.Context, tx pgx.Tx, tenant, actor, id st
 		return Reservation{}, fmt.Errorf("inconsistent position %s/%s: on_hand=%d reserved=%d quantity=%d", p.LocationID, p.SKU, p.OnHand, p.Reserved, r.Quantity)
 	}
 
-	cogs := p.InventoryValueCents * r.Quantity / p.OnHand
-	if r.Quantity == p.OnHand {
-		cogs = p.InventoryValueCents
+	costUses, cogs, err := s.consumeFIFO(ctx, tx, tenant, p.LocationID, p.SKU, r.Quantity)
+	if err != nil {
+		return Reservation{}, err
+	}
+	if err := s.recordConsumptions(ctx, tx, tenant, p.LocationID, p.SKU, costUses, "reservation", r.ID); err != nil {
+		return Reservation{}, err
 	}
 
 	if _, err := tx.Exec(ctx,
@@ -617,6 +673,7 @@ func (s *Service) confirmTx(ctx context.Context, tx pgx.Tx, tenant, actor, id st
 		"sku":            r.SKU,
 		"quantity":       r.Quantity,
 		"cogs_cents":     cogs,
+		"cost_layers":    costLayerPayload(costUses),
 	}); err != nil {
 		return Reservation{}, err
 	}
@@ -696,9 +753,16 @@ func (s *Service) createTransferTx(ctx context.Context, tx pgx.Tx, tenant, actor
 		return Transfer{}, fmt.Errorf("%w: available=%d requested=%d", ErrInsufficientStock, p.Available, in.Quantity)
 	}
 
-	value := p.InventoryValueCents * in.Quantity / p.OnHand
-	if in.Quantity == p.OnHand {
-		value = p.InventoryValueCents
+	id, err := newID()
+	if err != nil {
+		return Transfer{}, err
+	}
+	costUses, value, err := s.consumeFIFO(ctx, tx, tenant, p.LocationID, p.SKU, in.Quantity)
+	if err != nil {
+		return Transfer{}, err
+	}
+	if err := s.recordConsumptions(ctx, tx, tenant, p.LocationID, p.SKU, costUses, "transfer_out", id); err != nil {
+		return Transfer{}, err
 	}
 
 	if _, err := tx.Exec(ctx,
@@ -713,11 +777,6 @@ func (s *Service) createTransferTx(ctx context.Context, tx pgx.Tx, tenant, actor
 		return Transfer{}, err
 	}
 
-	id, err := newID()
-	if err != nil {
-		return Transfer{}, err
-	}
-
 	var t Transfer
 	if err := tx.QueryRow(ctx,
 		`INSERT INTO transfers (tenant_id, id, from_location_id, to_location_id, sku, quantity, value_cents, status)
@@ -726,6 +785,17 @@ func (s *Service) createTransferTx(ctx context.Context, tx pgx.Tx, tenant, actor
 		tenant, id, in.FromLocationID, in.ToLocationID, in.SKU, in.Quantity, value,
 	).Scan(&t.ID, &t.FromLocationID, &t.ToLocationID, &t.SKU, &t.Quantity, &t.ValueCents, &t.Status, &t.CreatedAt, &t.ReceivedAt); err != nil {
 		return Transfer{}, err
+	}
+
+	for _, use := range costUses {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO transfer_layers
+			 (tenant_id, transfer_id, sku, quantity, value_cents, received_at, source_layer_id)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+			tenant, t.ID, t.SKU, use.Quantity, use.ValueCents, use.ReceivedAt, use.LayerID,
+		); err != nil {
+			return Transfer{}, err
+		}
 	}
 
 	if err := s.recordMovement(ctx, tx, tenant, in.FromLocationID, in.SKU, "transfer_out", -in.Quantity, -value, "transfer", t.ID); err != nil {
@@ -741,6 +811,7 @@ func (s *Service) createTransferTx(ctx context.Context, tx pgx.Tx, tenant, actor
 		"sku":              t.SKU,
 		"quantity":         t.Quantity,
 		"value_cents":      t.ValueCents,
+		"cost_layers":      costLayerPayload(costUses),
 	}); err != nil {
 		return Transfer{}, err
 	}
@@ -772,6 +843,54 @@ func (s *Service) receiveTransferTx(ctx context.Context, tx pgx.Tx, tenant, acto
 		tenant, t.ToLocationID, t.SKU, t.Quantity, t.ValueCents,
 	); err != nil {
 		return Transfer{}, err
+	}
+
+	rows, err := tx.Query(ctx,
+		`SELECT id, quantity, value_cents, received_at
+		 FROM transfer_layers
+		 WHERE tenant_id = $1 AND transfer_id = $2 AND settled_at IS NULL
+		 ORDER BY received_at, id`,
+		tenant, t.ID,
+	)
+	if err != nil {
+		return Transfer{}, err
+	}
+	type transferLayer struct {
+		id         int64
+		quantity   int64
+		valueCents int64
+		receivedAt time.Time
+	}
+	var layers []transferLayer
+	for rows.Next() {
+		var l transferLayer
+		if err := rows.Scan(&l.id, &l.quantity, &l.valueCents, &l.receivedAt); err != nil {
+			rows.Close()
+			return Transfer{}, err
+		}
+		layers = append(layers, l)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return Transfer{}, err
+	}
+	if len(layers) == 0 {
+		if err := s.createCostLayer(ctx, tx, tenant, t.ToLocationID, t.SKU, t.Quantity, t.ValueCents, t.CreatedAt, "transfer", t.ID); err != nil {
+			return Transfer{}, err
+		}
+	} else {
+		for _, l := range layers {
+			if err := s.createCostLayer(ctx, tx, tenant, t.ToLocationID, t.SKU, l.quantity, l.valueCents, l.receivedAt, "transfer", t.ID); err != nil {
+				return Transfer{}, err
+			}
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE transfer_layers SET settled_at = now()
+			 WHERE tenant_id = $1 AND transfer_id = $2 AND settled_at IS NULL`,
+			tenant, t.ID,
+		); err != nil {
+			return Transfer{}, err
+		}
 	}
 
 	if err := tx.QueryRow(ctx,

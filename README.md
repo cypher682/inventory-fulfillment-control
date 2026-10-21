@@ -14,23 +14,23 @@ v0.2 implemented on PostgreSQL. Correctness is enforced in the database transact
 | 3 | Multi-location + transfer orders | done |
 | 4 | ATP / promising engine | done (single-hop, in-transit and expiry aware) |
 | 5 | Event-sourced fulfillment pipeline | partial: append-only events + relay-ready outbox, no replay/rebuild |
-| 6 | Costing + inventory sub-ledger | done: moving value + double-entry postings |
+| 6 | Costing + inventory sub-ledger | done: FIFO cost layers + double-entry postings |
 | 7 | Load testing + observability | done: concurrency tests, load harness with percentiles, Prometheus counters/histograms |
 | 8 | Multi-tenant controls + audit queries | done: tenant isolation and paginated audit APIs |
 
 ## What works
 
-- Receipts create positions and cost value.
+- Receipts create positions and append FIFO cost layers.
 - Reservations decrement available stock under a row lock; concurrent orders cannot oversell.
-- Confirm ships stock, releases the reservation, computes COGS, and posts a balanced journal entry.
+- Confirm ships stock, consumes the oldest cost layers, releases the reservation, and posts a balanced journal entry.
 - Release restores availability. Expired reservations are released by a `SKIP LOCKED` sweeper, and ATP reports them as available immediately.
-- Transfers move quantity and value between locations through in-transit, with ledger postings on both sides.
+- Transfers move quantity and value between locations through in-transit, preserving the consumed layers for destination FIFO.
 - ATP reports on-hand, reserved, expired-reserved, available, and incoming in-transit quantity.
 - Adjustments and cycle-count corrections post to `inventory_adjustment`, cannot consume reserved stock, and keep the sub-ledger balanced.
 - Idempotency keys make mutations safely retryable.
 - Append-only inventory events and a transactional outbox are written in the same transaction; the relay supports leases, retries, and backoff.
-- Reconciliation runs on a repeatable-read snapshot and checks position vs movements, reservations, ledger balance, inventory value, and in-transit value.
-- Audit APIs page through events, movements, and ledger entries per tenant.
+- Reconciliation runs on a repeatable-read snapshot and checks position vs movements, cost layers, reservations, ledger balance, inventory value, and in-transit value.
+- Audit APIs page through events, movements, ledger entries, cost layers, and layer consumptions per tenant.
 - Multi-tenant isolation is enforced in every query.
 
 ## Documents
@@ -88,7 +88,7 @@ migrations          migration notes (actual SQL is embedded in internal/store)
 ## Known limits
 
 - Single currency; all values are integer cents.
-- Moving-value costing, not FIFO layers.
+- FIFO costing with per-layer remaining quantity and value; rounding is absorbed by the layer being fully consumed.
 - Reservation expiry is swept every 10 seconds by default (`EXPIRY_INTERVAL`); ATP accounts for expired claims before the sweep runs.
 - The outbox relay ships events through a pluggable publisher; the bundled publisher only logs. A broker adapter is not included.
 - No authentication; tenancy is asserted by the `X-Tenant-ID` header and must be trusted at the edge.

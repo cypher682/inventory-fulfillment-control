@@ -112,4 +112,15 @@ echo "14. reconciliation"
 get "/v1/reconciliation" | pretty
 
 echo
+echo "15. FIFO: receive 3 at 100 and 2 at 400, then ship 4"
+FIFO_SKU="sku-fifo"
+post "/v1/receipts" "{\"location_id\":\"$LOC_A\",\"sku\":\"$FIFO_SKU\",\"quantity\":3,\"unit_cost_cents\":100}" "fifo-receipt-1" >/dev/null
+post "/v1/receipts" "{\"location_id\":\"$LOC_A\",\"sku\":\"$FIFO_SKU\",\"quantity\":2,\"unit_cost_cents\":400}" "fifo-receipt-2" >/dev/null
+FIFO_RESERVATION=$(post "/v1/reservations" "{\"location_id\":\"$LOC_A\",\"sku\":\"$FIFO_SKU\",\"quantity\":4}" "fifo-reserve-1")
+FIFO_RESERVATION_ID=$(printf '%s' "$FIFO_RESERVATION" | id_of)
+post "/v1/reservations/$FIFO_RESERVATION_ID/confirm" "" "fifo-confirm-1" >/dev/null
+get "/v1/positions/$LOC_A/$FIFO_SKU" | pretty
+get "/v1/audit/cost-consumptions?ref_type=reservation&ref_id=$FIFO_RESERVATION_ID" | pretty
+
+echo
 echo "done: tenant $TENANT"

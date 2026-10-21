@@ -34,7 +34,7 @@ Base path: `/v1`. All requests require `X-Tenant-ID`. Mutating requests may send
 {"location_id":"wh-a","sku":"sku-1","quantity":10,"unit_cost_cents":500}
 ```
 
-Creates the tenant/location/item on first use, adds on-hand quantity and inventory value, posts `Dr inventory / Cr inventory_source`, and returns the position.
+Creates the tenant/location/item on first use, adds on-hand quantity and inventory value, appends a FIFO cost layer, posts `Dr inventory / Cr inventory_source`, and returns the position.
 
 ### POST /v1/adjustments
 
@@ -46,7 +46,7 @@ Creates the tenant/location/item on first use, adds on-hand quantity and invento
 {"location_id":"wh-a","sku":"sku-1","quantity_delta":3,"unit_cost_cents":600,"reason":"cycle count surplus"}
 ```
 
-Applies a signed correction. Positive deltas add on-hand at `unit_cost_cents`; negative deltas remove on-hand at moving value and cannot consume reserved stock. Posts `Dr inventory / Cr inventory_adjustment` for gains and `Dr inventory_adjustment / Cr inventory` for losses. Returns the adjustment and the updated position.
+Applies a signed correction. Positive deltas add on-hand and a new FIFO layer at `unit_cost_cents`; negative deltas consume the oldest layers and cannot consume reserved stock. Posts `Dr inventory / Cr inventory_adjustment` for gains and `Dr inventory_adjustment / Cr inventory` for losses. Returns the adjustment and the updated position.
 
 ### POST /v1/reservations
 
@@ -58,7 +58,7 @@ Applies a signed correction. Positive deltas add on-hand at `unit_cost_cents`; n
 
 ### POST /v1/reservations/{id}/confirm
 
-Ships the reserved quantity: decrements on-hand and reserved, posts `Dr cogs / Cr inventory` at moving value, and marks the reservation `confirmed`. Repeating the call returns the confirmed reservation.
+Ships the reserved quantity: consumes the oldest cost layers, decrements on-hand and reserved, posts `Dr cogs / Cr inventory` at the consumed layer value, and marks the reservation `confirmed`. Repeating the call returns the confirmed reservation.
 
 ### POST /v1/reservations/{id}/release
 
@@ -93,11 +93,11 @@ Returns on-hand, reserved, expired-but-not-yet-swept reserved, available, and in
 {"from_location_id":"wh-a","to_location_id":"wh-b","sku":"sku-1","quantity":2}
 ```
 
-Moves quantity and value out of the source into in-transit (`Dr inventory_in_transit / Cr inventory`). Requires enough available stock at the source.
+Moves quantity and value out of the source into in-transit (`Dr inventory_in_transit / Cr inventory`), consuming source FIFO layers and staging their cost. Requires enough available stock at the source.
 
 ### POST /v1/transfers/{id}/receive
 
-Adds quantity and value to the destination and clears in-transit (`Dr inventory / Cr inventory_in_transit`). Repeating the call is safe.
+Adds quantity and value to the destination, recreates the staged FIFO layers, and clears in-transit (`Dr inventory / Cr inventory_in_transit`). Repeating the call is safe.
 
 ### GET /v1/transfers/{id}
 
@@ -111,11 +111,11 @@ Returns the transfer.
 
 Checks:
 
-- on-hand equals the sum of quantity movements per position;
+- on-hand equals the sum of quantity movements and remaining cost-layer quantity per position;
 - reserved equals the sum of active reservations per position;
 - the ledger balances for the tenant;
-- each position's value equals its `inventory` ledger balance;
-- the in-transit ledger equals the value of in-transit transfers.
+- each position's value equals its `inventory` ledger balance and remaining cost-layer value;
+- the in-transit ledger equals the value of in-transit transfers and their pending layers.
 
 Returns `409` when `ok` is false.
 
@@ -134,6 +134,18 @@ Pages through inventory movements. Filters: `location_id`, `sku`, `movement_type
 ### GET /v1/audit/ledger
 
 Pages through ledger entries. Filters: `account`, `location_id`, `sku`, `ref_type`, `ref_id`, `after`, `limit`.
+
+### GET /v1/audit/cost-layers
+
+Pages through FIFO layers. Filters: `location_id`, `sku`, `include_empty`, `after`, `limit`. Fully consumed layers are hidden unless `include_empty=true`.
+
+```json
+{"layers":[{"id":7,"location_id":"wh-a","sku":"sku-1","original_quantity":10,"remaining_quantity":6,"original_value_cents":5000,"remaining_value_cents":3000,"received_at":"2026-10-20T12:00:00Z","source_type":"receipt","source_id":"..."}],"next_after":7,"has_more":false}
+```
+
+### GET /v1/audit/cost-consumptions
+
+Pages through per-layer FIFO consumption traces. Filters: `layer_id`, `location_id`, `sku`, `ref_type`, `ref_id`, `after`, `limit`.
 
 Audit pagination is ascending by numeric `id`. Pass the returned `next_after` as `after` for the next page. `limit` defaults to 50 and is capped at 200.
 

@@ -295,6 +295,32 @@ func TestHTTPAdjustmentsAuditAndExpiry(t *testing.T) {
 		t.Fatalf("ledger = %+v", ledger)
 	}
 
+	resp = doRequest(t, client, http.MethodGet, server.URL+"/v1/audit/cost-layers?location_id=loc-ops&sku=sku-ops", tenant, "", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("cost layers status = %d", resp.StatusCode)
+	}
+	layers := decodeBody[CostLayerPage](t, resp)
+	if len(layers.Layers) != 1 || layers.Layers[0].RemainingQuantity != 7 ||
+		layers.Layers[0].RemainingValueCents != 1750 {
+		t.Fatalf("cost layers = %+v", layers)
+	}
+
+	resp = doRequest(t, client, http.MethodGet, server.URL+"/v1/audit/cost-consumptions?ref_type=adjustment&ref_id="+adjustment.ID, tenant, "", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("cost consumptions status = %d", resp.StatusCode)
+	}
+	consumptions := decodeBody[CostConsumptionPage](t, resp)
+	if len(consumptions.Consumptions) != 1 ||
+		consumptions.Consumptions[0].ValueCents != 750 ||
+		consumptions.Consumptions[0].Quantity != 3 {
+		t.Fatalf("cost consumptions = %+v", consumptions)
+	}
+
+	resp = doRequest(t, client, http.MethodGet, server.URL+"/v1/audit/cost-consumptions?layer_id=bad", tenant, "", "")
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid layer_id status = %d, want 400", resp.StatusCode)
+	}
+
 	resp = doRequest(t, client, http.MethodGet, server.URL+"/v1/audit/events?limit=201", tenant, "", "")
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("invalid limit status = %d, want 400", resp.StatusCode)

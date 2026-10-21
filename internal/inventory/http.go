@@ -38,6 +38,8 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/audit/events", s.listEvents)
 	mux.HandleFunc("GET /v1/audit/movements", s.listMovements)
 	mux.HandleFunc("GET /v1/audit/ledger", s.listLedger)
+	mux.HandleFunc("GET /v1/audit/cost-layers", s.listCostLayers)
+	mux.HandleFunc("GET /v1/audit/cost-consumptions", s.listCostConsumptions)
 	mux.HandleFunc("GET /metrics", s.metrics)
 }
 
@@ -280,6 +282,63 @@ func (s *Server) listLedger(w http.ResponseWriter, r *http.Request) {
 	}
 	page, err := s.service.ListLedger(r.Context(), tenant, LedgerFilter{
 		Account:    r.URL.Query().Get("account"),
+		LocationID: r.URL.Query().Get("location_id"),
+		SKU:        r.URL.Query().Get("sku"),
+		RefType:    r.URL.Query().Get("ref_type"),
+		RefID:      r.URL.Query().Get("ref_id"),
+		After:      after,
+		Limit:      limit,
+	})
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
+}
+
+func (s *Server) listCostLayers(w http.ResponseWriter, r *http.Request) {
+	tenant, ok := s.tenant(w, r)
+	if !ok {
+		return
+	}
+	after, limit, ok := auditParams(w, r)
+	if !ok {
+		return
+	}
+	page, err := s.service.ListCostLayers(r.Context(), tenant, CostLayerFilter{
+		LocationID:   r.URL.Query().Get("location_id"),
+		SKU:          r.URL.Query().Get("sku"),
+		IncludeEmpty: r.URL.Query().Get("include_empty") == "true",
+		After:        after,
+		Limit:        limit,
+	})
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
+}
+
+func (s *Server) listCostConsumptions(w http.ResponseWriter, r *http.Request) {
+	tenant, ok := s.tenant(w, r)
+	if !ok {
+		return
+	}
+	after, limit, ok := auditParams(w, r)
+	if !ok {
+		return
+	}
+	var layerID int64
+	if raw := r.URL.Query().Get("layer_id"); raw != "" {
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || parsed <= 0 {
+			writeError(w, http.StatusBadRequest, "validation", "layer_id must be a positive integer")
+			return
+		}
+		layerID = parsed
+	}
+	page, err := s.service.ListCostConsumptions(r.Context(), tenant, CostConsumptionFilter{
+		LayerID:    layerID,
 		LocationID: r.URL.Query().Get("location_id"),
 		SKU:        r.URL.Query().Get("sku"),
 		RefType:    r.URL.Query().Get("ref_type"),

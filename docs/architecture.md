@@ -21,6 +21,9 @@ internal/outbox      lease-based transactional outbox relay with pluggable publi
 | `reservations` | active / confirmed / released / expired claims |
 | `transfers` | in-transit quantity and value between locations |
 | `adjustments` | signed cycle-count and shrinkage corrections with a reason |
+| `cost_layers` | FIFO layers with remaining quantity and remaining value |
+| `transfer_layers` | per-layer cost staging for in-transit transfers |
+| `cost_consumptions` | per-layer trace of every FIFO consumption |
 | `inventory_movements` | append-only quantity/value deltas per position |
 | `ledger_entries` | double-entry postings in integer cents |
 | `inventory_events` | append-only domain events with actor and payload |
@@ -36,8 +39,9 @@ Every mutation:
 3. validates input;
 4. locks the position or reservation row with `SELECT ... FOR UPDATE`;
 5. applies the state change with a guarded `UPDATE`;
-6. appends movements, ledger entries, an event, and an outbox row;
-7. stores the idempotency response and commits.
+6. consumes or appends FIFO cost layers as needed;
+7. appends movements, ledger entries, an event, and an outbox row;
+8. stores the idempotency response and commits.
 
 A failure at any step rolls back all of it.
 
@@ -50,6 +54,7 @@ A failure at any step rolls back all of it.
 | Multi-location transfer | strong at source, causal in transit | source decrement + in-transit record; destination receives later |
 | Reservation expiry | strong | sweeper locks rows with `SKIP LOCKED`, restores reserved, marks expired |
 | Adjustments | strong | guarded position update; cannot consume reserved stock |
+| Costing | strong | FIFO layers consumed under the position lock, with a per-layer trace |
 | Ledger | strong + balanced | debit/credit rows written together; reconciliation verifies tenant balance |
 | Downstream consumers | eventual, at-least-once | outbox lease + retry with backoff |
 | Idempotent retries | effectively once | unique `(tenant, key)` + stored response |
@@ -65,7 +70,13 @@ A failure at any step rolls back all of it.
 | Adjustment gain | `inventory` | `inventory_adjustment` |
 | Adjustment loss | `inventory_adjustment` | `inventory` |
 
-Values are integer cents. The inventory value of a position moves with stock: a ship or transfer of `q` from `on_hand` units worth `V` moves `V * q / on_hand` (all of `V` when `q == on_hand`).
+Values are integer cents. COGS, transfer value, and adjustment value come from the oldest remaining layers. A partial layer is consumed at `remaining_value * take / remaining_quantity` (floor); fully consuming a layer takes all of its remaining value, so rounding never creates or destroys cents. Transfers carry each consumed layer through `transfer_layers` and recreate it at the destination, preserving acquisition order.
+
+## Costing
+
+Each receipt and positive adjustment appends a layer with quantity, value, and `received_at`. Ships, transfers out, and negative adjustments lock the position and consume layers ordered by `(received_at, id)`. Each consumption is written to `cost_consumptions` with the layer, quantity, value, and source reference. Reservations remain quantity-level; FIFO allocation happens at confirm, when the actual cost is known.
+
+A transfer consumes source layers and writes the same chunks to `transfer_layers`. Receiving the transfer recreates them at the destination with their original `received_at` and marks the staging rows settled. This preserves acquisition order across locations.
 
 ## Hot-SKU strategy
 
@@ -73,11 +84,12 @@ One row per position, locked with `SELECT ... FOR UPDATE`, then updated under `r
 
 ## Invariants checked by reconciliation
 
-1. `on_hand` = sum of quantity movements.
+1. `on_hand` = sum of quantity movements = sum of remaining layer quantity.
 2. `reserved` = sum of active reservations.
 3. Tenant ledger debits = credits.
-4. Position value = `inventory` ledger balance.
-5. In-transit ledger = value of in-transit transfers.
+4. Position value = `inventory` ledger balance = sum of remaining layer value.
+5. In-transit ledger = value of in-transit transfers = pending transfer-layer value.
+6. Movement value deltas = layer consumptions and additions for the position.
 
 ## Background workers
 
@@ -97,5 +109,5 @@ One row per position, locked with `SELECT ... FOR UPDATE`, then updated under `r
 - Event replay/rebuild of positions from the log.
 - Broker-backed outbox publisher.
 - Authentication and authorization.
-- FIFO layers, lot/serial tracking, quality holds.
+- Lot/serial tracking, quality holds, and LIFO/specific identification.
 - Partitioning for extreme hot-key contention.
