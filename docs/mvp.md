@@ -11,24 +11,25 @@ Prove the core inventory invariant end to end before adding scale mechanics:
 | Capability | Implementation |
 |------------|----------------|
 | Multi-tenant positions | `positions` keyed by `(tenant, location, sku)` |
-| Receipts | append movement and a FIFO cost layer |
-| Reservations | `SELECT ... FOR UPDATE` + conditional availability check |
+| Receipts | append movement and a FIFO cost layer; optional lot, expiry, and serials |
+| Reservations | one conditional `UPDATE` on the position row |
+| Lots / serials | lot-aware FIFO, serial lifecycle, quality holds excluded from ATP and consumption |
 | Expiry | `SKIP LOCKED` sweeper releases expired reservations; confirm rejects them |
 | Release | restore reserved quantity |
 | Confirm / ship | consume oldest layers, decrement on-hand + reserved, post COGS vs inventory |
 | Transfers | consume source layers, stage them in transit, recreate at destination |
 | Adjustments | signed quantity change with a required reason; negative deltas consume FIFO |
-| ATP | available = on-hand - reserved + expired-not-yet-swept; incoming in-transit |
+| ATP | available = on-hand - reserved - held + expired-not-yet-swept; incoming in-transit |
 | Idempotency | `idempotency_keys`, request hash, stored response |
 | Events | append-only `inventory_events` + outbox in the same transaction |
 | Delivery | log, NATS JetStream with ack/dedupe, or HMAC-signed HTTP webhook |
 | Audit | paginated events, movements, ledger, cost layers, and consumptions per tenant |
-| Reconciliation | snapshot-consistent check over movements, layers, reservations, ledger, transfers |
+| Reconciliation | snapshot-consistent check over movements, layers, reservations, held lots, serials, ledger, transfers |
 | Authn | optional per-tenant API keys; scoped authz and user identity are out of scope |
 
 ## Invariants
 
-1. `available = on_hand - reserved >= 0` for every position.
+1. `available = on_hand - reserved - held >= 0` for every position.
 2. A reservation succeeds only if the available quantity was sufficient at commit time.
 3. Releasing or confirming a reservation changes `reserved` exactly once.
 4. Every movement with financial impact posts debit and credit entries of equal value.
@@ -37,9 +38,11 @@ Prove the core inventory invariant end to end before adding scale mechanics:
 7. In-transit ledger balance equals the value of transfers still in transit and their pending layer value.
 8. A replayed idempotency key returns the original response and never re-applies effects.
 9. An expired reservation cannot be confirmed; its reserved quantity is restored exactly once.
-10. An adjustment cannot consume quantity that is reserved for an active order.
-11. A ship or transfer consumes the oldest layers first; consuming a full layer takes its exact remaining value.
-12. With auth enabled, a valid key resolves to exactly one tenant and cannot be widened by `X-Tenant-ID`.
+10. An adjustment cannot consume quantity that is reserved for an active order or on quality hold.
+11. A held lot is excluded from available and skipped by FIFO until released.
+12. A ship or transfer consumes the oldest non-held layers first; consuming a full layer takes its exact remaining value.
+13. Serial state follows physical state: shipped on confirm, in-transit on transfer, adjusted on write-off, and back in stock on transfer receipt.
+14. With auth enabled, a valid key resolves to exactly one tenant and cannot be widened by `X-Tenant-ID`.
 
 ## Evidence
 
@@ -55,6 +58,11 @@ Prove the core inventory invariant end to end before adding scale mechanics:
 | `TestFIFOConfirmConsumesOldestLayers` | COGS follows receipt order and leaves the correct remaining layer |
 | `TestFIFOTransferPreservesLayerCosts` | transferred layers keep their cost and acquisition order at the destination |
 | `TestFIFONegativeAdjustmentUsesOldestLayers` | write-offs consume FIFO and preserve the sub-ledger |
+| `TestLotSerialsFollowFIFOAndConfirm` | confirm consumes the oldest lot, ships its serials, and leaves later lots intact |
+| `TestQualityHoldSkipsHeldLotAndBlocksAvailability` | held stock leaves ATP, is skipped by FIFO, and can be released |
+| `TestSerialTransferMovesSerials` | serials move in-transit and return to stock at the destination |
+| `TestReceiptRejectsInvalidSerialMetadata` | serial count, duplicates, and expiry without a lot are rejected |
+| `TestHTTPLotHoldAndSerialAudit` | hold and list endpoints work over HTTP and held stock cannot be reserved |
 | `TestConcurrentConfirmationsConsumeFIFOExactly` | 100 concurrent confirms consume the layers exactly once and balance COGS |
 | `TestReplayRebuildsPositionsFromMovementLog` | replayed quantity/value match positions and drift is detected |
 | `TestAuthRequiresValidKey` | missing and invalid keys return 401 before reaching a handler |
@@ -76,15 +84,17 @@ Prove the core inventory invariant end to end before adding scale mechanics:
 - Migration `0003` backfills one synthetic layer per existing position; pre-FIFO history did not preserve layer identity.
 - One database, one write path. Reservations use a single conditional update; the hot-key benchmark, capacity-lease design, and enablement gate are in `docs/partitioning.md`. Sharded counters are not active yet.
 - The outbox relay ships with log, NATS JetStream, and HMAC webhook publishers. NATS dedupes by outbox ID for one hour; webhooks rely on receiver idempotency.
-- Replay rebuilds positions from movements, not the full event stream; cost layers and reservations are verified by reconciliation instead.
+- Replay rebuilds positions from movements, not the full event stream; cost layers, lots, serials, and reservations are verified by reconciliation instead.
 - API keys are static secrets with full tenant access; there is no rotation, scoped permission, or per-user identity.
 - Outbox delivery is at-least-once. NATS dedupes by outbox ID for one hour; webhook receivers must dedupe themselves. There is no dead-letter stream or schema registry.
-- No negative-stock backorders, lot tracking, serials, quality holds, or LIFO/specific identification in this MVP.
+- No negative-stock backorders, LIFO, or specific identification.
+- Lots and serials are optional receipt metadata. Reservations are not lot-specific; FIFO picks the oldest non-held layer, and expiry does not affect allocation.
+- Holds are per location and do not propagate to other locations or to in-transit stock.
 
 ## Next milestones
 
-1. Lot/serial tracking and quality holds layered on top of FIFO.
-2. Bucket-based reservation partitioning for hot `(tenant, location, sku)` rows.
-3. Key rotation, scoped permissions, and signed internal service identity.
-4. Full projection rebuild from `inventory_events`.
-5. Dead-letter stream, consumer lag monitoring, and a schema registry.
+1. Bucket-based reservation partitioning for hot `(tenant, location, sku)` rows.
+2. Key rotation, scoped permissions, and signed internal service identity.
+3. Full projection rebuild from `inventory_events`.
+4. Dead-letter stream, consumer lag monitoring, and a schema registry.
+5. Lot-specific allocation, expiry-driven FIFO, and serial reservation.

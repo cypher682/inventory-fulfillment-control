@@ -4,7 +4,7 @@ High-scale inventory control plane for multi-location retailers, distributors, a
 
 ## Status
 
-v0.7 implemented on PostgreSQL, with optional NATS JetStream delivery. Correctness is enforced in the database transaction path and covered by integration tests, including concurrent oversell, expiry, and FIFO allocation tests.
+v0.8 implemented on PostgreSQL, with optional NATS JetStream delivery. Correctness is enforced in the database transaction path and covered by integration tests, including concurrent oversell, expiry, FIFO allocation, lot holds, and serial transfers.
 
 | Stage | Scope | State |
 |-------|-------|-------|
@@ -18,20 +18,22 @@ v0.7 implemented on PostgreSQL, with optional NATS JetStream delivery. Correctne
 | 7 | Load testing + observability | done: concurrency tests, load harness with percentiles, Prometheus counters/histograms |
 | 8 | Multi-tenant controls + audit queries | done: tenant isolation, optional API keys, paginated audit APIs |
 | 9 | Hot-key contention strategy | done: atomic reserve fast path, multi-SKU benchmark, capacity-lease design |
+| 10 | Lot/serial tracking + quality holds | done: lot-aware FIFO, serial lifecycle, holds excluded from ATP and consumption |
 
 ## What works
 
-- Receipts create positions and append FIFO cost layers.
+- Receipts create positions and append FIFO cost layers, optionally tagged with a lot, expiry, and serial numbers.
 - Reservations decrement available stock with one conditional `UPDATE`; concurrent orders cannot oversell.
-- Confirm ships stock, consumes the oldest cost layers, releases the reservation, and posts a balanced journal entry.
+- Confirm ships stock, consumes the oldest non-held cost layers, returns lot/serial fulfillment, releases the reservation, and posts a balanced journal entry.
+- Quality holds keep lot quantity on hand but remove it from available and skip it during FIFO consumption.
 - Release restores availability. Expired reservations are released by a `SKIP LOCKED` sweeper, and ATP reports them as available immediately.
-- Transfers move quantity and value between locations through in-transit, preserving the consumed layers for destination FIFO.
-- ATP reports on-hand, reserved, expired-reserved, available, and incoming in-transit quantity.
-- Adjustments and cycle-count corrections post to `inventory_adjustment`, cannot consume reserved stock, and keep the sub-ledger balanced.
+- Transfers move quantity and value between locations through in-transit, preserving consumed layers, lots, and serial lifecycle state for destination FIFO.
+- ATP reports on-hand, reserved, held, expired-reserved, available, and incoming in-transit quantity.
+- Adjustments and cycle-count corrections post to `inventory_adjustment`, cannot consume reserved or held stock, and keep the sub-ledger balanced.
 - Idempotency keys make mutations safely retryable.
 - Append-only inventory events and a transactional outbox are written in the same transaction; the relay supports leases, retries, and backoff.
 - The relay can deliver to NATS JetStream (durable, acked, deduplicated by outbox ID), an HMAC-signed HTTP webhook, or the log.
-- Reconciliation runs on a repeatable-read snapshot and checks position vs movements, cost layers, reservations, ledger balance, inventory value, and in-transit value.
+- Reconciliation runs on a repeatable-read snapshot and checks position vs movements, cost layers, reservations, held lots, serial counts, ledger balance, inventory value, and in-transit value.
 - The replay verifier rebuilds position quantity and value from the append-only movement log and reports drift; it is available as an API and as `cmd/replay`.
 - Audit APIs page through events, movements, ledger entries, cost layers, and layer consumptions per tenant.
 - Multi-tenant isolation is enforced in every query.
@@ -138,5 +140,7 @@ migrations          migration notes (actual SQL is embedded in internal/store)
 - Reservation expiry is swept every 10 seconds by default (`EXPIRY_INTERVAL`); ATP accounts for expired claims before the sweep runs.
 - NATS delivery is at-least-once with a one-hour dedupe window; webhook delivery is at-least-once and relies on the receiver for idempotency. There is no dead-letter stream or schema registry.
 - API keys are static per-tenant secrets from `API_KEYS`; there is no rotation, scopes, or user identity. When auth is disabled, tenancy is asserted by `X-Tenant-ID` and must be trusted at the edge.
-- Replay verifies positions from movements; it does not rebuild cost layers or reservations from the event stream.
+- Replay verifies positions from movements; it does not rebuild cost layers, lots, serials, or reservations from the event stream.
+- Lots and serials are optional receipt metadata. Reservations are not lot-specific and FIFO chooses the oldest non-held layer; there is no expiry-driven allocation or serial reservation.
+- Holds are location-scoped. Positive adjustments create untracked layers, and serial uniqueness is per tenant.
 - Hot rows still serialize on one position. `docs/partitioning.md` records the measured contention, the capacity-lease bucket design, and the gate for enabling it; sharded counters are not active yet.

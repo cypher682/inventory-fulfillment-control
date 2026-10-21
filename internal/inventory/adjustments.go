@@ -89,13 +89,13 @@ func (s *Service) adjustTx(ctx context.Context, tx pgx.Tx, tenant, actor string,
 				 inventory_value_cents = positions.inventory_value_cents + EXCLUDED.inventory_value_cents,
 				 version = positions.version + 1,
 				 updated_at = now()
-			 RETURNING location_id, sku, on_hand, reserved, inventory_value_cents, version, updated_at`,
+			 RETURNING location_id, sku, on_hand, reserved, held, inventory_value_cents, version, updated_at`,
 			tenant, in.LocationID, in.SKU, in.QuantityDelta, value,
 		).Scan(&position.LocationID, &position.SKU, &position.OnHand, &position.Reserved,
-			&position.InventoryValueCents, &position.Version, &position.UpdatedAt); err != nil {
+			&position.Held, &position.InventoryValueCents, &position.Version, &position.UpdatedAt); err != nil {
 			return Adjustment{}, err
 		}
-		if err := s.createCostLayer(ctx, tx, tenant, in.LocationID, in.SKU, in.QuantityDelta, value, s.clock(), "adjustment", id); err != nil {
+		if _, err := s.createCostLayer(ctx, tx, tenant, in.LocationID, in.SKU, in.QuantityDelta, value, s.clock(), "adjustment", id, ""); err != nil {
 			return Adjustment{}, err
 		}
 	} else {
@@ -111,6 +111,16 @@ func (s *Service) adjustTx(ctx context.Context, tx pgx.Tx, tenant, actor string,
 		if err != nil {
 			return Adjustment{}, err
 		}
+		for i := range costUses {
+			serials, err := s.claimLayerSerials(ctx, tx, tenant, costUses[i].LayerID, costUses[i].Quantity)
+			if err != nil {
+				return Adjustment{}, err
+			}
+			if err := s.setSerialState(ctx, tx, tenant, serials, "adjusted", nil, nil); err != nil {
+				return Adjustment{}, err
+			}
+			costUses[i].Serials = serials
+		}
 		if err := s.recordConsumptions(ctx, tx, tenant, in.LocationID, in.SKU, costUses, "adjustment", id); err != nil {
 			return Adjustment{}, err
 		}
@@ -122,14 +132,14 @@ func (s *Service) adjustTx(ctx context.Context, tx pgx.Tx, tenant, actor string,
 				 version = version + 1,
 				 updated_at = now()
 			 WHERE tenant_id = $1 AND location_id = $2 AND sku = $3
-			 RETURNING location_id, sku, on_hand, reserved, inventory_value_cents, version, updated_at`,
+			 RETURNING location_id, sku, on_hand, reserved, held, inventory_value_cents, version, updated_at`,
 			tenant, in.LocationID, in.SKU, quantity, value,
 		).Scan(&position.LocationID, &position.SKU, &position.OnHand, &position.Reserved,
-			&position.InventoryValueCents, &position.Version, &position.UpdatedAt); err != nil {
+			&position.Held, &position.InventoryValueCents, &position.Version, &position.UpdatedAt); err != nil {
 			return Adjustment{}, err
 		}
 	}
-	position.Available = position.OnHand - position.Reserved
+	position.Available = position.OnHand - position.Reserved - position.Held
 
 	signedValue := value
 	if in.QuantityDelta < 0 {
@@ -170,6 +180,7 @@ func (s *Service) adjustTx(ctx context.Context, tx pgx.Tx, tenant, actor string,
 		"value_delta_cents": signedValue,
 		"reason":            reason,
 		"on_hand":           position.OnHand,
+		"held":              position.Held,
 		"inventory_value":   position.InventoryValueCents,
 		"cost_layers":       costLayerPayload(costUses),
 	}); err != nil {

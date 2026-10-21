@@ -22,9 +22,11 @@ internal/outbox      lease-based relay with log, NATS JetStream, and HMAC webhoo
 | `reservations` | active / confirmed / released / expired claims |
 | `transfers` | in-transit quantity and value between locations |
 | `adjustments` | signed cycle-count and shrinkage corrections with a reason |
-| `cost_layers` | FIFO layers with remaining quantity and remaining value |
-| `transfer_layers` | per-layer cost staging for in-transit transfers |
+| `cost_layers` | FIFO layers with remaining quantity, value, and optional lot |
+| `transfer_layers` | per-layer cost and lot staging for in-transit transfers |
 | `cost_consumptions` | per-layer trace of every FIFO consumption |
+| `lots` | lot status, expiry, and quality hold per `(tenant, location, sku, lot_code)` |
+| `inventory_serials` | serial number lifecycle tied to a lot, layer, and location |
 | `inventory_movements` | append-only quantity/value deltas per position |
 | `ledger_entries` | double-entry postings in integer cents |
 | `inventory_events` | append-only domain events with actor and payload |
@@ -38,9 +40,9 @@ Every mutation:
 1. begins a transaction;
 2. claims the idempotency key (if supplied) or reads the stored response;
 3. validates input;
-4. locks the position or reservation row with `SELECT ... FOR UPDATE`;
+4. locks the reservation row when confirming/releasing, or uses one conditional `UPDATE` for reservations;
 5. applies the state change with a guarded `UPDATE`;
-6. consumes or appends FIFO cost layers as needed;
+6. consumes or appends FIFO cost layers, skipping lots on quality hold, and updates serial state as needed;
 7. appends movements, ledger entries, an event, and an outbox row;
 8. stores the idempotency response and commits.
 
@@ -54,7 +56,9 @@ A failure at any step rolls back all of it.
 | Reservation | strong | available check and `reserved` increment in one transaction |
 | Multi-location transfer | strong at source, causal in transit | source decrement + in-transit record; destination receives later |
 | Reservation expiry | strong | sweeper locks rows with `SKIP LOCKED`, restores reserved, marks expired |
-| Adjustments | strong | guarded position update; cannot consume reserved stock |
+| Adjustments | strong | guarded position update; cannot consume reserved or held stock |
+| Quality holds | strong | `positions.held` updated in the same transaction as lot status |
+| Lot/serial lifecycle | strong | lots and serials updated in the same transaction as the movement |
 | Costing | strong | FIFO layers consumed under the position lock, with a per-layer trace |
 | Ledger | strong + balanced | debit/credit rows written together; reconciliation verifies tenant balance |
 | Downstream consumers | eventual, at-least-once | outbox lease + retry with backoff |
@@ -75,28 +79,30 @@ Values are integer cents. COGS, transfer value, and adjustment value come from t
 
 ## Costing
 
-Each receipt and positive adjustment appends a layer with quantity, value, and `received_at`. Ships, transfers out, and negative adjustments lock the position and consume layers ordered by `(received_at, id)`. Each consumption is written to `cost_consumptions` with the layer, quantity, value, and source reference. Reservations remain quantity-level; FIFO allocation happens at confirm, when the actual cost is known.
+Each receipt and positive adjustment appends a layer with quantity, value, and `received_at`. Receipts may also carry a lot code, expiry, and serial numbers; positive adjustments stay untracked. Ships, transfers out, and negative adjustments lock the position and consume layers ordered by `(received_at, id)`, skipping layers whose lot is on quality hold. Each consumption is written to `cost_consumptions` with the layer, quantity, value, and source reference. Reservations remain quantity-level; FIFO allocation happens at confirm, when the actual cost and lots are known. Confirm returns the lot/serial fulfillment and marks serials shipped.
 
-A transfer consumes source layers and writes the same chunks to `transfer_layers`. Receiving the transfer recreates them at the destination with their original `received_at` and marks the staging rows settled. This preserves acquisition order across locations.
+A transfer consumes source layers and writes the same chunks, including lot codes, to `transfer_layers`. Serials move to `in_transit`. Receiving the transfer recreates the layers at the destination with their original `received_at`, moves serials to `in_stock` at the destination, and marks the staging rows settled. This preserves acquisition order, lots, and serial identity across locations.
 
 ## Hot-SKU strategy
 
-Reservation uses one conditional `UPDATE` that increments `reserved` only when `on_hand - reserved >= quantity`. This removes the separate `SELECT ... FOR UPDATE` round trip while keeping the row as the correctness boundary. `cmd/loadtest -skus` measures single-row contention against a spread workload; the results and the approved capacity-lease bucket design are in [partitioning.md](partitioning.md). Sharded counters are not enabled yet.
+Reservation uses one conditional `UPDATE` that increments `reserved` only when `on_hand - reserved - held >= quantity`. This removes the separate `SELECT ... FOR UPDATE` round trip while keeping the row as the correctness boundary. `cmd/loadtest -skus` measures single-row contention against a spread workload; the results and the approved capacity-lease bucket design are in [partitioning.md](partitioning.md). Sharded counters are not enabled yet.
 
 ## Replay verifier
 
 `Replay` reads the tenant's movements and positions in one repeatable-read snapshot, groups movements by `(location, sku)`, and compares `SUM(quantity_delta)` and `SUM(value_delta_cents)` with the materialized position. The report keeps replayed and recorded values side by side and lists drift, movements without a position, and positions without movements. It is read-only and is exposed as `GET /v1/audit/replay` and `cmd/replay -tenant <id>`.
 
-This verifies the position projection, not the whole event-sourced history: cost layers and reservations remain materialized state and are covered by reconciliation.
+This verifies the position projection, not the whole event-sourced history: cost layers, lots, serials, and reservations remain materialized state and are covered by reconciliation.
 
 ## Invariants checked by reconciliation
 
 1. `on_hand` = sum of quantity movements = sum of remaining layer quantity.
 2. `reserved` = sum of active reservations.
-3. Tenant ledger debits = credits.
-4. Position value = `inventory` ledger balance = sum of remaining layer value.
-5. In-transit ledger = value of in-transit transfers = pending transfer-layer value.
-6. Movement value deltas = layer consumptions and additions for the position.
+3. `held` = sum of remaining quantity in held lots.
+4. Each serial-tracked layer's remaining quantity = its in-stock serial count.
+5. Tenant ledger debits = credits.
+6. Position value = `inventory` ledger balance = sum of remaining layer value.
+7. In-transit ledger = value of in-transit transfers = pending transfer-layer value.
+8. Movement value deltas = layer consumptions and additions for the position.
 
 ## Authentication
 
@@ -132,5 +138,5 @@ The relay claims a batch under a 30s lease, publishes each envelope, marks succe
 - Full projection rebuild from `inventory_events` (replay currently uses the movement log).
 - Dead-letter stream, consumer lag monitoring, and a schema registry.
 - Key rotation, scoped authorization, and user identity.
-- Lot/serial tracking, quality holds, and LIFO/specific identification.
+- LIFO/specific identification, lot-specific reservation/allocation, and expiry-driven FIFO.
 - Bucket-based reservation partitioning for extreme hot-key contention; the design and migration plan are documented but not enabled.

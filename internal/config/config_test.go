@@ -50,6 +50,18 @@ func TestLoadDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadDatabaseURL(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://user:pass@db:5432/custom?sslmode=require")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.DatabaseURL != "postgres://user:pass@db:5432/custom?sslmode=require" {
+		t.Fatalf("DatabaseURL = %q", cfg.DatabaseURL)
+	}
+}
+
 func TestLoadPublisherConfig(t *testing.T) {
 	t.Setenv("OUTBOX_PUBLISHER", "NATS")
 	t.Setenv("NATS_URL", "nats://nats:4222")

@@ -191,7 +191,8 @@ func (s *Service) ListCostLayers(ctx context.Context, tenant string, f CostLayer
 
 	rows, err := s.pool.Query(ctx,
 		`SELECT id, location_id, sku, original_quantity, remaining_quantity,
-		        original_value_cents, remaining_value_cents, received_at, source_type, source_id
+		        original_value_cents, remaining_value_cents, received_at, source_type, source_id,
+		        COALESCE(lot_code, '')
 		 FROM cost_layers
 		 WHERE `+where+`
 		 ORDER BY id
@@ -207,7 +208,7 @@ func (s *Service) ListCostLayers(ctx context.Context, tenant string, f CostLayer
 	for rows.Next() {
 		var l CostLayer
 		if err := rows.Scan(&l.ID, &l.LocationID, &l.SKU, &l.OriginalQuantity, &l.RemainingQuantity,
-			&l.OriginalValueCents, &l.RemainingValueCents, &l.ReceivedAt, &l.SourceType, &l.SourceID); err != nil {
+			&l.OriginalValueCents, &l.RemainingValueCents, &l.ReceivedAt, &l.SourceType, &l.SourceID, &l.LotCode); err != nil {
 			return CostLayerPage{}, err
 		}
 		layers = append(layers, l)

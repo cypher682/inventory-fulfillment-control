@@ -11,9 +11,11 @@ import (
 
 type layerUse struct {
 	LayerID    int64
+	LotCode    string
 	Quantity   int64
 	ValueCents int64
 	ReceivedAt time.Time
+	Serials    []string
 }
 
 func (s *Service) createCostLayer(
@@ -22,22 +24,28 @@ func (s *Service) createCostLayer(
 	tenant, locationID, sku string,
 	quantity, valueCents int64,
 	receivedAt time.Time,
-	sourceType, sourceID string,
-) error {
+	sourceType, sourceID, lotCode string,
+) (int64, error) {
 	if quantity <= 0 {
-		return fmt.Errorf("cost layer quantity must be positive, got %d", quantity)
+		return 0, fmt.Errorf("cost layer quantity must be positive, got %d", quantity)
 	}
 	if valueCents < 0 {
-		return fmt.Errorf("cost layer value must be non-negative, got %d", valueCents)
+		return 0, fmt.Errorf("cost layer value must be non-negative, got %d", valueCents)
 	}
-	_, err := tx.Exec(ctx,
+	var lot any
+	if lotCode != "" {
+		lot = lotCode
+	}
+	var id int64
+	err := tx.QueryRow(ctx,
 		`INSERT INTO cost_layers
 		 (tenant_id, location_id, sku, original_quantity, remaining_quantity,
-		  original_value_cents, remaining_value_cents, received_at, source_type, source_id)
-		 VALUES ($1, $2, $3, $4, $4, $5, $5, $6, $7, $8)`,
-		tenant, locationID, sku, quantity, valueCents, receivedAt, sourceType, sourceID,
-	)
-	return err
+		  original_value_cents, remaining_value_cents, received_at, source_type, source_id, lot_code)
+		 VALUES ($1, $2, $3, $4, $4, $5, $5, $6, $7, $8, $9)
+		 RETURNING id`,
+		tenant, locationID, sku, quantity, valueCents, receivedAt, sourceType, sourceID, lot,
+	).Scan(&id)
+	return id, err
 }
 
 // consumeFIFO takes quantity from the oldest remaining layers and returns the
@@ -54,11 +62,20 @@ func (s *Service) consumeFIFO(
 	}
 
 	rows, err := tx.Query(ctx,
-		`SELECT id, remaining_quantity, remaining_value_cents, received_at
-		 FROM cost_layers
-		 WHERE tenant_id = $1 AND location_id = $2 AND sku = $3
-		   AND remaining_quantity > 0
-		 ORDER BY received_at, id
+		`SELECT cl.id, cl.remaining_quantity, cl.remaining_value_cents, cl.received_at,
+		        COALESCE(cl.lot_code, '')
+		 FROM cost_layers cl
+		 WHERE cl.tenant_id = $1 AND cl.location_id = $2 AND cl.sku = $3
+		   AND cl.remaining_quantity > 0
+		   AND (cl.lot_code IS NULL OR NOT EXISTS (
+				SELECT 1 FROM lots l
+				WHERE l.tenant_id = cl.tenant_id
+				  AND l.location_id = cl.location_id
+				  AND l.sku = cl.sku
+				  AND l.lot_code = cl.lot_code
+				  AND l.status = 'hold'
+		   ))
+		 ORDER BY cl.received_at, cl.id
 		 FOR UPDATE`,
 		tenant, locationID, sku,
 	)
@@ -71,11 +88,12 @@ func (s *Service) consumeFIFO(
 		quantity   int64
 		valueCents int64
 		receivedAt time.Time
+		lotCode    string
 	}
 	var layers []layer
 	for rows.Next() {
 		var l layer
-		if err := rows.Scan(&l.id, &l.quantity, &l.valueCents, &l.receivedAt); err != nil {
+		if err := rows.Scan(&l.id, &l.quantity, &l.valueCents, &l.receivedAt, &l.lotCode); err != nil {
 			rows.Close()
 			return nil, 0, err
 		}
@@ -106,6 +124,7 @@ func (s *Service) consumeFIFO(
 		}
 		uses = append(uses, layerUse{
 			LayerID:    l.id,
+			LotCode:    l.lotCode,
 			Quantity:   take,
 			ValueCents: takeValue,
 			ReceivedAt: l.receivedAt,
@@ -158,11 +177,18 @@ func (s *Service) recordConsumptions(
 func costLayerPayload(uses []layerUse) []map[string]any {
 	out := make([]map[string]any, 0, len(uses))
 	for _, use := range uses {
-		out = append(out, map[string]any{
+		entry := map[string]any{
 			"layer_id":    use.LayerID,
 			"quantity":    use.Quantity,
 			"value_cents": use.ValueCents,
-		})
+		}
+		if use.LotCode != "" {
+			entry["lot_code"] = use.LotCode
+		}
+		if len(use.Serials) > 0 {
+			entry["serials"] = use.Serials
+		}
+		out = append(out, entry)
 	}
 	return out
 }

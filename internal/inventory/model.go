@@ -10,6 +10,7 @@ type Position struct {
 	SKU                 string    `json:"sku"`
 	OnHand              int64     `json:"on_hand"`
 	Reserved            int64     `json:"reserved"`
+	Held                int64     `json:"held"`
 	Available           int64     `json:"available"`
 	InventoryValueCents int64     `json:"inventory_value_cents"`
 	Version             int64     `json:"version"`
@@ -17,14 +18,23 @@ type Position struct {
 }
 
 type Reservation struct {
-	ID         string    `json:"id"`
-	LocationID string    `json:"location_id"`
-	SKU        string    `json:"sku"`
-	Quantity   int64     `json:"quantity"`
-	Status     string    `json:"status"`
-	ExpiresAt  time.Time `json:"expires_at"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	ID          string    `json:"id"`
+	LocationID  string    `json:"location_id"`
+	SKU         string    `json:"sku"`
+	Quantity    int64     `json:"quantity"`
+	Status      string    `json:"status"`
+	ExpiresAt   time.Time `json:"expires_at"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+	Fulfillment []LotUse  `json:"fulfillment,omitempty"`
+}
+
+type LotUse struct {
+	LayerID    int64    `json:"layer_id"`
+	LotCode    string   `json:"lot_code,omitempty"`
+	Quantity   int64    `json:"quantity"`
+	ValueCents int64    `json:"value_cents"`
+	Serials    []string `json:"serials,omitempty"`
 }
 
 type Transfer struct {
@@ -45,6 +55,7 @@ type ATP struct {
 	Found           bool      `json:"found"`
 	OnHand          int64     `json:"on_hand"`
 	Reserved        int64     `json:"reserved"`
+	Held            int64     `json:"held"`
 	ExpiredReserved int64     `json:"expired_reserved"`
 	Available       int64     `json:"available"`
 	InTransit       int64     `json:"in_transit"`
@@ -58,10 +69,43 @@ type Reconciliation struct {
 }
 
 type ReceiveInput struct {
-	LocationID    string `json:"location_id"`
-	SKU           string `json:"sku"`
-	Quantity      int64  `json:"quantity"`
-	UnitCostCents int64  `json:"unit_cost_cents"`
+	LocationID    string     `json:"location_id"`
+	SKU           string     `json:"sku"`
+	Quantity      int64      `json:"quantity"`
+	UnitCostCents int64      `json:"unit_cost_cents"`
+	LotCode       string     `json:"lot_code,omitempty"`
+	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
+	SerialNumbers []string   `json:"serial_numbers,omitempty"`
+}
+
+type Lot struct {
+	LocationID string     `json:"location_id"`
+	SKU        string     `json:"sku"`
+	LotCode    string     `json:"lot_code"`
+	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
+	Status     string     `json:"status"`
+	Remaining  int64      `json:"remaining"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
+}
+
+type HoldLotInput struct {
+	LocationID string `json:"location_id"`
+	SKU        string `json:"sku"`
+	LotCode    string `json:"lot_code"`
+	Hold       bool   `json:"hold"`
+}
+
+type Serial struct {
+	Serial     string    `json:"serial"`
+	LocationID string    `json:"location_id"`
+	SKU        string    `json:"sku"`
+	LotCode    string    `json:"lot_code"`
+	Status     string    `json:"status"`
+	LayerID    int64     `json:"layer_id"`
+	TransferID string    `json:"transfer_id,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 type ReserveInput struct {
@@ -144,6 +188,7 @@ type CostLayer struct {
 	ReceivedAt          time.Time `json:"received_at"`
 	SourceType          string    `json:"source_type"`
 	SourceID            string    `json:"source_id"`
+	LotCode             string    `json:"lot_code,omitempty"`
 }
 
 type CostConsumption struct {

@@ -167,9 +167,9 @@ func (s *Service) ATP(ctx context.Context, tenant, locationID, sku string) (ATP,
 	}
 
 	now := s.clock()
-	var onHand, reserved, expiredReserved int64
+	var onHand, reserved, held, expiredReserved int64
 	err := s.pool.QueryRow(ctx,
-		`SELECT p.on_hand, p.reserved,
+		`SELECT p.on_hand, p.reserved, p.held,
 		        COALESCE((
 					SELECT SUM(r.quantity)
 					FROM reservations r
@@ -182,7 +182,7 @@ func (s *Service) ATP(ctx context.Context, tenant, locationID, sku string) (ATP,
 		 FROM positions p
 		 WHERE p.tenant_id = $1 AND p.location_id = $2 AND p.sku = $3`,
 		tenant, locationID, sku, now,
-	).Scan(&onHand, &reserved, &expiredReserved)
+	).Scan(&onHand, &reserved, &held, &expiredReserved)
 	found := true
 	if errors.Is(err, pgx.ErrNoRows) {
 		found = false
@@ -205,8 +205,9 @@ func (s *Service) ATP(ctx context.Context, tenant, locationID, sku string) (ATP,
 		Found:           found,
 		OnHand:          onHand,
 		Reserved:        reserved,
+		Held:            held,
 		ExpiredReserved: expiredReserved,
-		Available:       onHand - reserved + expiredReserved,
+		Available:       onHand - reserved - held + expiredReserved,
 		InTransit:       inTransit,
 		AsOf:            now,
 	}, nil
@@ -284,6 +285,72 @@ func (s *Service) Reconcile(ctx context.Context, tenant string) (Reconciliation,
 	}
 	reservedRows.Close()
 	if err := reservedRows.Err(); err != nil {
+		return Reconciliation{}, err
+	}
+
+	heldRows, err := tx.Query(ctx,
+		`SELECT p.location_id, p.sku, p.held, COALESCE(h.qty, 0)
+		 FROM positions p
+		 LEFT JOIN (
+			SELECT cl.location_id, cl.sku, SUM(cl.remaining_quantity) AS qty
+			FROM cost_layers cl
+			JOIN lots l
+			  ON l.tenant_id = cl.tenant_id
+			 AND l.location_id = cl.location_id
+			 AND l.sku = cl.sku
+			 AND l.lot_code = cl.lot_code
+			WHERE cl.tenant_id = $1 AND l.status = 'hold'
+			GROUP BY cl.location_id, cl.sku
+		 ) h ON h.location_id = p.location_id AND h.sku = p.sku
+		 WHERE p.tenant_id = $1 AND p.held <> COALESCE(h.qty, 0)
+		 ORDER BY p.location_id, p.sku`, tenant)
+	if err != nil {
+		return Reconciliation{}, err
+	}
+	for heldRows.Next() {
+		var loc, sku string
+		var held, lotQuantity int64
+		if err := heldRows.Scan(&loc, &sku, &held, &lotQuantity); err != nil {
+			heldRows.Close()
+			return Reconciliation{}, err
+		}
+		issues = append(issues, fmt.Sprintf("position %s/%s held=%d but held lots=%d", loc, sku, held, lotQuantity))
+	}
+	heldRows.Close()
+	if err := heldRows.Err(); err != nil {
+		return Reconciliation{}, err
+	}
+
+	serialRows, err := tx.Query(ctx,
+		`SELECT cl.id, cl.location_id, cl.sku, cl.remaining_quantity,
+		        COUNT(s.serial) FILTER (WHERE s.status = 'in_stock')
+		 FROM cost_layers cl
+		 JOIN (
+			SELECT DISTINCT layer_id FROM inventory_serials WHERE tenant_id = $1
+		 ) tracked ON tracked.layer_id = cl.id
+		 LEFT JOIN inventory_serials s
+		   ON s.tenant_id = cl.tenant_id
+		  AND s.layer_id = cl.id
+		  AND s.status = 'in_stock'
+		 WHERE cl.tenant_id = $1
+		 GROUP BY cl.id, cl.location_id, cl.sku, cl.remaining_quantity
+		 HAVING cl.remaining_quantity <> COUNT(s.serial) FILTER (WHERE s.status = 'in_stock')
+		 ORDER BY cl.location_id, cl.sku, cl.id`, tenant)
+	if err != nil {
+		return Reconciliation{}, err
+	}
+	for serialRows.Next() {
+		var layerID, remaining, inStock int64
+		var loc, sku string
+		if err := serialRows.Scan(&layerID, &loc, &sku, &remaining, &inStock); err != nil {
+			serialRows.Close()
+			return Reconciliation{}, err
+		}
+		issues = append(issues, fmt.Sprintf(
+			"layer %d %s/%s remaining=%d but in-stock serials=%d", layerID, loc, sku, remaining, inStock))
+	}
+	serialRows.Close()
+	if err := serialRows.Err(); err != nil {
 		return Reconciliation{}, err
 	}
 
@@ -493,6 +560,20 @@ func (s *Service) receiveTx(ctx context.Context, tx pgx.Tx, tenant, actor string
 	if in.UnitCostCents > 0 && in.Quantity > math.MaxInt64/in.UnitCostCents {
 		return Position{}, &ValidationError{Field: "quantity", Message: "value overflow"}
 	}
+	lotCode, err := validateLotCode(in.LotCode)
+	if err != nil {
+		return Position{}, err
+	}
+	if lotCode == "" && in.ExpiresAt != nil {
+		return Position{}, &ValidationError{Field: "expires_at", Message: "requires lot_code"}
+	}
+	if lotCode == "" && len(in.SerialNumbers) > 0 {
+		return Position{}, &ValidationError{Field: "serial_numbers", Message: "requires lot_code"}
+	}
+	serials, err := validateSerials(in.SerialNumbers, in.Quantity)
+	if err != nil {
+		return Position{}, err
+	}
 
 	if err := s.ensureMasterData(ctx, tx, tenant, []string{in.LocationID}, in.SKU); err != nil {
 		return Position{}, err
@@ -508,18 +589,38 @@ func (s *Service) receiveTx(ctx context.Context, tx pgx.Tx, tenant, actor string
 			 inventory_value_cents = positions.inventory_value_cents + EXCLUDED.inventory_value_cents,
 			 version = positions.version + 1,
 			 updated_at = now()
-		 RETURNING location_id, sku, on_hand, reserved, inventory_value_cents, version, updated_at`,
+		 RETURNING location_id, sku, on_hand, reserved, held, inventory_value_cents, version, updated_at`,
 		tenant, in.LocationID, in.SKU, in.Quantity, value,
-	).Scan(&p.LocationID, &p.SKU, &p.OnHand, &p.Reserved, &p.InventoryValueCents, &p.Version, &p.UpdatedAt); err != nil {
+	).Scan(&p.LocationID, &p.SKU, &p.OnHand, &p.Reserved, &p.Held, &p.InventoryValueCents, &p.Version, &p.UpdatedAt); err != nil {
 		return Position{}, err
 	}
-	p.Available = p.OnHand - p.Reserved
+
+	lotStatus, _, err := s.ensureLot(ctx, tx, tenant, p.LocationID, p.SKU, lotCode, in.ExpiresAt)
+	if err != nil {
+		return Position{}, err
+	}
+	if lotStatus == "hold" {
+		if err := tx.QueryRow(ctx,
+			`UPDATE positions
+			 SET held = held + $4, version = version + 1, updated_at = now()
+			 WHERE tenant_id = $1 AND location_id = $2 AND sku = $3
+			 RETURNING held`,
+			tenant, p.LocationID, p.SKU, in.Quantity,
+		).Scan(&p.Held); err != nil {
+			return Position{}, err
+		}
+	}
+	p.Available = p.OnHand - p.Reserved - p.Held
 
 	receiptID, err := newID()
 	if err != nil {
 		return Position{}, err
 	}
-	if err := s.createCostLayer(ctx, tx, tenant, p.LocationID, p.SKU, in.Quantity, value, s.clock(), "receipt", receiptID); err != nil {
+	layerID, err := s.createCostLayer(ctx, tx, tenant, p.LocationID, p.SKU, in.Quantity, value, s.clock(), "receipt", receiptID, lotCode)
+	if err != nil {
+		return Position{}, err
+	}
+	if err := s.recordSerials(ctx, tx, tenant, p.LocationID, p.SKU, lotCode, layerID, serials); err != nil {
 		return Position{}, err
 	}
 	if err := s.recordMovement(ctx, tx, tenant, p.LocationID, p.SKU, "receive", in.Quantity, value, "receipt", receiptID); err != nil {
@@ -534,8 +635,12 @@ func (s *Service) receiveTx(ctx context.Context, tx pgx.Tx, tenant, actor string
 		"quantity":        in.Quantity,
 		"unit_cost_cents": in.UnitCostCents,
 		"on_hand":         p.OnHand,
+		"held":            p.Held,
 		"inventory_value": p.InventoryValueCents,
 		"receipt_id":      receiptID,
+		"lot_code":        lotCode,
+		"expires_at":      in.ExpiresAt,
+		"serial_numbers":  serials,
 	}); err != nil {
 		return Position{}, err
 	}
@@ -566,14 +671,14 @@ func (s *Service) reserveTx(ctx context.Context, tx pgx.Tx, tenant, actor string
 		`UPDATE positions
 		 SET reserved = reserved + $4, version = version + 1, updated_at = now()
 		 WHERE tenant_id = $1 AND location_id = $2 AND sku = $3
-		   AND on_hand - reserved >= $4
+		   AND on_hand - reserved - held >= $4
 		 RETURNING reserved`,
 		tenant, in.LocationID, in.SKU, in.Quantity,
 	).Scan(&reserved)
 	if errors.Is(err, pgx.ErrNoRows) {
 		var available int64
 		err := tx.QueryRow(ctx,
-			`SELECT on_hand - reserved FROM positions
+			`SELECT on_hand - reserved - held FROM positions
 			 WHERE tenant_id = $1 AND location_id = $2 AND sku = $3`,
 			tenant, in.LocationID, in.SKU,
 		).Scan(&available)
@@ -644,6 +749,23 @@ func (s *Service) confirmTx(ctx context.Context, tx pgx.Tx, tenant, actor, id st
 	costUses, cogs, err := s.consumeFIFO(ctx, tx, tenant, p.LocationID, p.SKU, r.Quantity)
 	if err != nil {
 		return Reservation{}, err
+	}
+	for i := range costUses {
+		serials, err := s.claimLayerSerials(ctx, tx, tenant, costUses[i].LayerID, costUses[i].Quantity)
+		if err != nil {
+			return Reservation{}, err
+		}
+		if err := s.setSerialState(ctx, tx, tenant, serials, "shipped", nil, nil); err != nil {
+			return Reservation{}, err
+		}
+		costUses[i].Serials = serials
+		r.Fulfillment = append(r.Fulfillment, LotUse{
+			LayerID:    costUses[i].LayerID,
+			LotCode:    costUses[i].LotCode,
+			Quantity:   costUses[i].Quantity,
+			ValueCents: costUses[i].ValueCents,
+			Serials:    serials,
+		})
 	}
 	if err := s.recordConsumptions(ctx, tx, tenant, p.LocationID, p.SKU, costUses, "reservation", r.ID); err != nil {
 		return Reservation{}, err
@@ -798,14 +920,31 @@ func (s *Service) createTransferTx(ctx context.Context, tx pgx.Tx, tenant, actor
 		return Transfer{}, err
 	}
 
-	for _, use := range costUses {
-		if _, err := tx.Exec(ctx,
+	for i := range costUses {
+		use := &costUses[i]
+		var transferLayerID int64
+		var lot any
+		if use.LotCode != "" {
+			lot = use.LotCode
+		}
+		if err := tx.QueryRow(ctx,
 			`INSERT INTO transfer_layers
-			 (tenant_id, transfer_id, sku, quantity, value_cents, received_at, source_layer_id)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-			tenant, t.ID, t.SKU, use.Quantity, use.ValueCents, use.ReceivedAt, use.LayerID,
-		); err != nil {
+			 (tenant_id, transfer_id, sku, quantity, value_cents, received_at, source_layer_id, lot_code)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			 RETURNING id`,
+			tenant, t.ID, t.SKU, use.Quantity, use.ValueCents, use.ReceivedAt, use.LayerID, lot,
+		).Scan(&transferLayerID); err != nil {
 			return Transfer{}, err
+		}
+		if use.LotCode != "" {
+			serials, err := s.claimLayerSerials(ctx, tx, tenant, use.LayerID, use.Quantity)
+			if err != nil {
+				return Transfer{}, err
+			}
+			if err := s.setSerialState(ctx, tx, tenant, serials, "in_transit", &t.ID, &transferLayerID); err != nil {
+				return Transfer{}, err
+			}
+			use.Serials = serials
 		}
 	}
 
@@ -857,11 +996,17 @@ func (s *Service) receiveTransferTx(ctx context.Context, tx pgx.Tx, tenant, acto
 	}
 
 	rows, err := tx.Query(ctx,
-		`SELECT id, quantity, value_cents, received_at
-		 FROM transfer_layers
-		 WHERE tenant_id = $1 AND transfer_id = $2 AND settled_at IS NULL
-		 ORDER BY received_at, id`,
-		tenant, t.ID,
+		`SELECT tl.id, tl.quantity, tl.value_cents, tl.received_at, COALESCE(tl.lot_code, ''),
+		        sl.expires_at
+		 FROM transfer_layers tl
+		 LEFT JOIN lots sl
+		   ON sl.tenant_id = tl.tenant_id
+		  AND sl.location_id = $3
+		  AND sl.sku = tl.sku
+		  AND sl.lot_code = tl.lot_code
+		 WHERE tl.tenant_id = $1 AND tl.transfer_id = $2 AND tl.settled_at IS NULL
+		 ORDER BY tl.received_at, tl.id`,
+		tenant, t.ID, t.FromLocationID,
 	)
 	if err != nil {
 		return Transfer{}, err
@@ -871,11 +1016,13 @@ func (s *Service) receiveTransferTx(ctx context.Context, tx pgx.Tx, tenant, acto
 		quantity   int64
 		valueCents int64
 		receivedAt time.Time
+		lotCode    string
+		expiresAt  *time.Time
 	}
 	var layers []transferLayer
 	for rows.Next() {
 		var l transferLayer
-		if err := rows.Scan(&l.id, &l.quantity, &l.valueCents, &l.receivedAt); err != nil {
+		if err := rows.Scan(&l.id, &l.quantity, &l.valueCents, &l.receivedAt, &l.lotCode, &l.expiresAt); err != nil {
 			rows.Close()
 			return Transfer{}, err
 		}
@@ -885,20 +1032,60 @@ func (s *Service) receiveTransferTx(ctx context.Context, tx pgx.Tx, tenant, acto
 	if err := rows.Err(); err != nil {
 		return Transfer{}, err
 	}
+	var held int64
 	if len(layers) == 0 {
-		if err := s.createCostLayer(ctx, tx, tenant, t.ToLocationID, t.SKU, t.Quantity, t.ValueCents, t.CreatedAt, "transfer", t.ID); err != nil {
+		if _, err := s.createCostLayer(ctx, tx, tenant, t.ToLocationID, t.SKU, t.Quantity, t.ValueCents, t.CreatedAt, "transfer", t.ID, ""); err != nil {
 			return Transfer{}, err
 		}
 	} else {
 		for _, l := range layers {
-			if err := s.createCostLayer(ctx, tx, tenant, t.ToLocationID, t.SKU, l.quantity, l.valueCents, l.receivedAt, "transfer", t.ID); err != nil {
+			lotStatus, _, err := s.ensureLot(ctx, tx, tenant, t.ToLocationID, t.SKU, l.lotCode, l.expiresAt)
+			if err != nil {
 				return Transfer{}, err
+			}
+			layerID, err := s.createCostLayer(ctx, tx, tenant, t.ToLocationID, t.SKU, l.quantity, l.valueCents, l.receivedAt, "transfer", t.ID, l.lotCode)
+			if err != nil {
+				return Transfer{}, err
+			}
+			if lotStatus == "hold" {
+				held += l.quantity
+			}
+			if l.lotCode != "" {
+				var inTransit int64
+				if err := tx.QueryRow(ctx,
+					`SELECT COUNT(*) FROM inventory_serials
+					 WHERE tenant_id = $1 AND transfer_layer_id = $2 AND status = 'in_transit'`,
+					tenant, l.id,
+				).Scan(&inTransit); err != nil {
+					return Transfer{}, err
+				}
+				if inTransit != 0 && inTransit != l.quantity {
+					return Transfer{}, fmt.Errorf("inconsistent serials for transfer layer %d: %d vs %d", l.id, inTransit, l.quantity)
+				}
+				if _, err := tx.Exec(ctx,
+					`UPDATE inventory_serials
+					 SET location_id = $3, layer_id = $4, status = 'in_stock',
+					     transfer_id = NULL, transfer_layer_id = NULL, updated_at = now()
+					 WHERE tenant_id = $1 AND transfer_layer_id = $2 AND status = 'in_transit'`,
+					tenant, l.id, t.ToLocationID, layerID,
+				); err != nil {
+					return Transfer{}, err
+				}
 			}
 		}
 		if _, err := tx.Exec(ctx,
 			`UPDATE transfer_layers SET settled_at = now()
 			 WHERE tenant_id = $1 AND transfer_id = $2 AND settled_at IS NULL`,
 			tenant, t.ID,
+		); err != nil {
+			return Transfer{}, err
+		}
+	}
+	if held > 0 {
+		if _, err := tx.Exec(ctx,
+			`UPDATE positions SET held = held + $4, updated_at = now()
+			 WHERE tenant_id = $1 AND location_id = $2 AND sku = $3`,
+			tenant, t.ToLocationID, t.SKU, held,
 		); err != nil {
 			return Transfer{}, err
 		}
@@ -961,37 +1148,37 @@ func (s *Service) ensureMasterData(ctx context.Context, tx pgx.Tx, tenant string
 func (s *Service) lockPosition(ctx context.Context, tx pgx.Tx, tenant, locationID, sku string) (Position, error) {
 	var p Position
 	err := tx.QueryRow(ctx,
-		`SELECT location_id, sku, on_hand, reserved, inventory_value_cents, version, updated_at
+		`SELECT location_id, sku, on_hand, reserved, held, inventory_value_cents, version, updated_at
 		 FROM positions
 		 WHERE tenant_id = $1 AND location_id = $2 AND sku = $3
 		 FOR UPDATE`,
 		tenant, locationID, sku,
-	).Scan(&p.LocationID, &p.SKU, &p.OnHand, &p.Reserved, &p.InventoryValueCents, &p.Version, &p.UpdatedAt)
+	).Scan(&p.LocationID, &p.SKU, &p.OnHand, &p.Reserved, &p.Held, &p.InventoryValueCents, &p.Version, &p.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Position{}, fmt.Errorf("%w: position %s/%s", ErrNotFound, locationID, sku)
 	}
 	if err != nil {
 		return Position{}, err
 	}
-	p.Available = p.OnHand - p.Reserved
+	p.Available = p.OnHand - p.Reserved - p.Held
 	return p, nil
 }
 
 func (s *Service) readPosition(ctx context.Context, tenant, locationID, sku string) (Position, error) {
 	var p Position
 	err := s.pool.QueryRow(ctx,
-		`SELECT location_id, sku, on_hand, reserved, inventory_value_cents, version, updated_at
+		`SELECT location_id, sku, on_hand, reserved, held, inventory_value_cents, version, updated_at
 		 FROM positions
 		 WHERE tenant_id = $1 AND location_id = $2 AND sku = $3`,
 		tenant, locationID, sku,
-	).Scan(&p.LocationID, &p.SKU, &p.OnHand, &p.Reserved, &p.InventoryValueCents, &p.Version, &p.UpdatedAt)
+	).Scan(&p.LocationID, &p.SKU, &p.OnHand, &p.Reserved, &p.Held, &p.InventoryValueCents, &p.Version, &p.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Position{}, fmt.Errorf("%w: position %s/%s", ErrNotFound, locationID, sku)
 	}
 	if err != nil {
 		return Position{}, err
 	}
-	p.Available = p.OnHand - p.Reserved
+	p.Available = p.OnHand - p.Reserved - p.Held
 	return p, nil
 }
 

@@ -53,6 +53,9 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/audit/ledger", s.listLedger)
 	mux.HandleFunc("GET /v1/audit/cost-layers", s.listCostLayers)
 	mux.HandleFunc("GET /v1/audit/cost-consumptions", s.listCostConsumptions)
+	mux.HandleFunc("POST /v1/lots/hold", s.holdLot)
+	mux.HandleFunc("GET /v1/lots", s.listLots)
+	mux.HandleFunc("GET /v1/serials", s.listSerials)
 	mux.HandleFunc("GET /metrics", s.metrics)
 }
 
@@ -381,6 +384,59 @@ func (s *Server) listCostConsumptions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, page)
+}
+
+func (s *Server) holdLot(w http.ResponseWriter, r *http.Request) {
+	tenant, ok := s.tenant(w, r)
+	if !ok {
+		return
+	}
+	var in HoldLotInput
+	if !decode(w, r, &in) {
+		return
+	}
+	lot, replay, err := s.service.HoldLot(r.Context(), tenant, actor(r), key(r), in)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeMutation(w, http.StatusOK, replay, lot)
+}
+
+func (s *Server) listLots(w http.ResponseWriter, r *http.Request) {
+	tenant, ok := s.tenant(w, r)
+	if !ok {
+		return
+	}
+	_, limit, ok := auditParams(w, r)
+	if !ok {
+		return
+	}
+	lots, err := s.service.ListLots(r.Context(), tenant, r.URL.Query().Get("location_id"), r.URL.Query().Get("sku"), limit)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"lots": lots})
+}
+
+func (s *Server) listSerials(w http.ResponseWriter, r *http.Request) {
+	tenant, ok := s.tenant(w, r)
+	if !ok {
+		return
+	}
+	_, limit, ok := auditParams(w, r)
+	if !ok {
+		return
+	}
+	serials, err := s.service.ListSerials(r.Context(), tenant,
+		r.URL.Query().Get("location_id"), r.URL.Query().Get("sku"),
+		r.URL.Query().Get("lot_code"), r.URL.Query().Get("status"), limit)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"serials": serials})
 }
 
 func auditParams(w http.ResponseWriter, r *http.Request) (int64, int, bool) {
