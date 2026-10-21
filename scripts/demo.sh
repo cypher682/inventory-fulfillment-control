@@ -86,7 +86,19 @@ get "/v1/positions/$LOC_A/$SKU" | pretty
 get "/v1/positions/$LOC_B/$SKU" | pretty
 
 echo
-echo "10. oversell attempt (expected 409)"
+echo "10. adjust 1 damaged unit out of $LOC_A"
+post "/v1/adjustments" "{\"location_id\":\"$LOC_A\",\"sku\":\"$SKU\",\"quantity_delta\":-1,\"reason\":\"damaged in demo\"}" "adjust-1" | pretty
+
+echo
+echo "11. audit: adjustment events"
+get "/v1/audit/events?event_type=inventory.adjusted" | pretty
+
+echo
+echo "12. audit: ledger entries for inventory adjustments"
+get "/v1/audit/ledger?account=inventory_adjustment" | pretty
+
+echo
+echo "13. oversell attempt (expected 409)"
 STATUS=$(curl -s -o /tmp/inventory-demo-error.json -w '%{http_code}' -X POST "$BASE/v1/reservations" \
   -H "X-Tenant-ID: $TENANT" \
   -H "Content-Type: application/json" \
@@ -96,7 +108,7 @@ pretty < /tmp/inventory-demo-error.json
 rm -f /tmp/inventory-demo-error.json
 
 echo
-echo "11. reconciliation"
+echo "14. reconciliation"
 get "/v1/reconciliation" | pretty
 
 echo

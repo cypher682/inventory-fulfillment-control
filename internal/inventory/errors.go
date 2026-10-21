@@ -9,6 +9,7 @@ var (
 	ErrNotFound            = errors.New("not found")
 	ErrInsufficientStock   = errors.New("insufficient available stock")
 	ErrInvalidState        = errors.New("invalid state transition")
+	ErrReservationExpired  = errors.New("reservation expired")
 	ErrIdempotencyMismatch = errors.New("idempotency key reused with a different request")
 	ErrRequestInProgress   = errors.New("request with this idempotency key is in progress")
 )

@@ -3,9 +3,11 @@ package inventory
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -22,6 +24,7 @@ func NewServer(service *Service, version string, log *slog.Logger) *Server {
 
 func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/receipts", s.receive)
+	mux.HandleFunc("POST /v1/adjustments", s.adjust)
 	mux.HandleFunc("POST /v1/reservations", s.reserve)
 	mux.HandleFunc("GET /v1/reservations/{id}", s.getReservation)
 	mux.HandleFunc("POST /v1/reservations/{id}/confirm", s.confirm)
@@ -32,6 +35,9 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/transfers/{id}", s.getTransfer)
 	mux.HandleFunc("POST /v1/transfers/{id}/receive", s.receiveTransfer)
 	mux.HandleFunc("GET /v1/reconciliation", s.reconcile)
+	mux.HandleFunc("GET /v1/audit/events", s.listEvents)
+	mux.HandleFunc("GET /v1/audit/movements", s.listMovements)
+	mux.HandleFunc("GET /v1/audit/ledger", s.listLedger)
 	mux.HandleFunc("GET /metrics", s.metrics)
 }
 
@@ -50,6 +56,23 @@ func (s *Server) receive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeMutation(w, http.StatusCreated, replay, position)
+}
+
+func (s *Server) adjust(w http.ResponseWriter, r *http.Request) {
+	tenant, ok := s.tenant(w, r)
+	if !ok {
+		return
+	}
+	var in AdjustmentInput
+	if !decode(w, r, &in) {
+		return
+	}
+	adjustment, replay, err := s.service.Adjust(r.Context(), tenant, actor(r), key(r), in)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeMutation(w, http.StatusCreated, replay, adjustment)
 }
 
 func (s *Server) reserve(w http.ResponseWriter, r *http.Request) {
@@ -200,10 +223,106 @@ func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, result)
 }
 
+func (s *Server) listEvents(w http.ResponseWriter, r *http.Request) {
+	tenant, ok := s.tenant(w, r)
+	if !ok {
+		return
+	}
+	after, limit, ok := auditParams(w, r)
+	if !ok {
+		return
+	}
+	page, err := s.service.ListEvents(r.Context(), tenant, EventFilter{
+		AggregateType: r.URL.Query().Get("aggregate_type"),
+		AggregateID:   r.URL.Query().Get("aggregate_id"),
+		EventType:     r.URL.Query().Get("event_type"),
+		After:         after,
+		Limit:         limit,
+	})
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
+}
+
+func (s *Server) listMovements(w http.ResponseWriter, r *http.Request) {
+	tenant, ok := s.tenant(w, r)
+	if !ok {
+		return
+	}
+	after, limit, ok := auditParams(w, r)
+	if !ok {
+		return
+	}
+	page, err := s.service.ListMovements(r.Context(), tenant, MovementFilter{
+		LocationID:   r.URL.Query().Get("location_id"),
+		SKU:          r.URL.Query().Get("sku"),
+		MovementType: r.URL.Query().Get("movement_type"),
+		After:        after,
+		Limit:        limit,
+	})
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
+}
+
+func (s *Server) listLedger(w http.ResponseWriter, r *http.Request) {
+	tenant, ok := s.tenant(w, r)
+	if !ok {
+		return
+	}
+	after, limit, ok := auditParams(w, r)
+	if !ok {
+		return
+	}
+	page, err := s.service.ListLedger(r.Context(), tenant, LedgerFilter{
+		Account:    r.URL.Query().Get("account"),
+		LocationID: r.URL.Query().Get("location_id"),
+		SKU:        r.URL.Query().Get("sku"),
+		RefType:    r.URL.Query().Get("ref_type"),
+		RefID:      r.URL.Query().Get("ref_id"),
+		After:      after,
+		Limit:      limit,
+	})
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
+}
+
+func auditParams(w http.ResponseWriter, r *http.Request) (int64, int, bool) {
+	after, err := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
+	if r.URL.Query().Get("after") == "" {
+		after, err = 0, nil
+	}
+	if err != nil || after < 0 {
+		writeError(w, http.StatusBadRequest, "validation", "after must be a non-negative integer")
+		return 0, 0, false
+	}
+	limit := 0
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > maxAuditLimit {
+			writeError(w, http.StatusBadRequest, "validation", "limit must be between 1 and 200")
+			return 0, 0, false
+		}
+		limit = parsed
+	}
+	return after, limit, true
+}
+
 func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	w.WriteHeader(http.StatusOK)
 	s.service.metrics.writePrometheus(w)
+	if pending, oldest, err := s.service.OutboxPending(r.Context()); err == nil {
+		fmt.Fprintf(w, "inventory_outbox_unpublished %d\n", pending)
+		fmt.Fprintf(w, "inventory_outbox_oldest_age_seconds %g\n", oldest)
+	}
 }
 
 func (s *Server) tenant(w http.ResponseWriter, r *http.Request) (string, bool) {
@@ -230,6 +349,8 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 		writeError(w, http.StatusConflict, "insufficient_stock", err.Error())
 	case errors.Is(err, ErrInvalidState):
 		writeError(w, http.StatusConflict, "invalid_state", err.Error())
+	case errors.Is(err, ErrReservationExpired):
+		writeError(w, http.StatusConflict, "reservation_expired", err.Error())
 	case errors.Is(err, ErrIdempotencyMismatch):
 		writeError(w, http.StatusUnprocessableEntity, "idempotency_mismatch", err.Error())
 	case errors.Is(err, ErrRequestInProgress):
@@ -252,6 +373,7 @@ func (s *Server) Handler(next http.Handler) http.Handler {
 					writeError(rec, http.StatusInternalServerError, "internal", "internal server error")
 				}
 			}
+			s.service.metrics.observeRequest(time.Since(start), rec.status)
 			s.log.Info("request",
 				"method", r.Method,
 				"path", r.URL.Path,

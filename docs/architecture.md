@@ -1,15 +1,15 @@
 # Architecture
 
-## Service shape (MVP)
+## Service shape
 
 Modular monolith with a single write path per inventory position:
 
 ```
-cmd/inventory        HTTP API + lifecycle
-cmd/loadtest         HTTP concurrency harness
-internal/inventory   positions, reservations, transfers, ATP, ledger, reconciliation
+cmd/inventory        HTTP API + lifecycle + expiry sweeper
+cmd/loadtest         HTTP concurrency and latency harness
+internal/inventory   positions, reservations, transfers, adjustments, ATP, audit, ledger
 internal/store       pgx pool + embedded migrations
-internal/outbox      transactional outbox dispatcher (local stub)
+internal/outbox      lease-based transactional outbox relay with pluggable publishers
 ```
 
 ## Data model
@@ -18,12 +18,13 @@ internal/outbox      transactional outbox dispatcher (local stub)
 |-------|---------|
 | `tenants`, `locations`, `items` | master data, auto-provisioned by receipts and transfers |
 | `positions` | materialized current state per `(tenant, location, sku)` |
-| `reservations` | active / confirmed / released claims |
+| `reservations` | active / confirmed / released / expired claims |
 | `transfers` | in-transit quantity and value between locations |
+| `adjustments` | signed cycle-count and shrinkage corrections with a reason |
 | `inventory_movements` | append-only quantity/value deltas per position |
 | `ledger_entries` | double-entry postings in integer cents |
 | `inventory_events` | append-only domain events with actor and payload |
-| `outbox` | pending events written in the same transaction |
+| `outbox` | pending events plus attempt count, lease time, and last error |
 | `idempotency_keys` | request hash + stored response per tenant/key |
 
 ## Write path
@@ -47,8 +48,10 @@ A failure at any step rolls back all of it.
 | Position per `(tenant, location, sku)` | strong | row lock + conditional update |
 | Reservation | strong | available check and `reserved` increment in one transaction |
 | Multi-location transfer | strong at source, causal in transit | source decrement + in-transit record; destination receives later |
+| Reservation expiry | strong | sweeper locks rows with `SKIP LOCKED`, restores reserved, marks expired |
+| Adjustments | strong | guarded position update; cannot consume reserved stock |
 | Ledger | strong + balanced | debit/credit rows written together; reconciliation verifies tenant balance |
-| Downstream consumers | eventual | outbox |
+| Downstream consumers | eventual, at-least-once | outbox lease + retry with backoff |
 | Idempotent retries | effectively once | unique `(tenant, key)` + stored response |
 
 ## Ledger accounts
@@ -59,6 +62,8 @@ A failure at any step rolls back all of it.
 | Ship / confirm | `cogs` | `inventory` |
 | Transfer out | `inventory_in_transit` | `inventory` |
 | Transfer in | `inventory` | `inventory_in_transit` |
+| Adjustment gain | `inventory` | `inventory_adjustment` |
+| Adjustment loss | `inventory_adjustment` | `inventory` |
 
 Values are integer cents. The inventory value of a position moves with stock: a ship or transfer of `q` from `on_hand` units worth `V` moves `V * q / on_hand` (all of `V` when `q == on_hand`).
 
@@ -74,16 +79,21 @@ One row per position, locked with `SELECT ... FOR UPDATE`, then updated under `r
 4. Position value = `inventory` ledger balance.
 5. In-transit ledger = value of in-transit transfers.
 
+## Background workers
+
+- Expiry sweeper runs every `EXPIRY_INTERVAL` (default 10s), processes `EXPIRY_BATCH` rows per tick, and emits `reservation.expired`.
+- Outbox relay claims a batch under a 30s lease, publishes each envelope, marks success, and records failures with exponential backoff. Delivery is at-least-once; the bundled publisher logs only.
+
 ## Failure handling
 
 - External commands are retryable through idempotency keys.
 - A crash before commit leaves no partial movement or ledger entry.
 - A crash after commit is safe to retry; the stored response is returned.
-- The outbox guarantees an event exists for every committed state change. Delivery is currently a local log stub and is marked published after logging.
+- The outbox guarantees an event exists for every committed state change. A crash after claiming delays delivery until the lease expires; a crash after publishing but before marking can duplicate delivery.
+- Reconciliation uses a repeatable-read snapshot so concurrent writes cannot produce false drift.
 
 ## Not implemented yet
 
-- Reservation expiry sweeper and automatic release.
 - Event replay/rebuild of positions from the log.
 - Broker-backed outbox publisher.
 - Authentication and authorization.

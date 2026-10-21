@@ -167,11 +167,22 @@ func (s *Service) ATP(ctx context.Context, tenant, locationID, sku string) (ATP,
 	}
 
 	now := s.clock()
-	var onHand, reserved int64
+	var onHand, reserved, expiredReserved int64
 	err := s.pool.QueryRow(ctx,
-		`SELECT on_hand, reserved FROM positions WHERE tenant_id = $1 AND location_id = $2 AND sku = $3`,
-		tenant, locationID, sku,
-	).Scan(&onHand, &reserved)
+		`SELECT p.on_hand, p.reserved,
+		        COALESCE((
+					SELECT SUM(r.quantity)
+					FROM reservations r
+					WHERE r.tenant_id = p.tenant_id
+					  AND r.location_id = p.location_id
+					  AND r.sku = p.sku
+					  AND r.status = 'active'
+					  AND r.expires_at <= $4
+				), 0)
+		 FROM positions p
+		 WHERE p.tenant_id = $1 AND p.location_id = $2 AND p.sku = $3`,
+		tenant, locationID, sku, now,
+	).Scan(&onHand, &reserved, &expiredReserved)
 	found := true
 	if errors.Is(err, pgx.ErrNoRows) {
 		found = false
@@ -189,21 +200,31 @@ func (s *Service) ATP(ctx context.Context, tenant, locationID, sku string) (ATP,
 	}
 
 	return ATP{
-		LocationID: locationID,
-		SKU:        sku,
-		Found:      found,
-		OnHand:     onHand,
-		Reserved:   reserved,
-		Available:  onHand - reserved,
-		InTransit:  inTransit,
-		AsOf:       now,
+		LocationID:      locationID,
+		SKU:             sku,
+		Found:           found,
+		OnHand:          onHand,
+		Reserved:        reserved,
+		ExpiredReserved: expiredReserved,
+		Available:       onHand - reserved + expiredReserved,
+		InTransit:       inTransit,
+		AsOf:            now,
 	}, nil
 }
 
 func (s *Service) Reconcile(ctx context.Context, tenant string) (Reconciliation, error) {
 	issues := make([]string, 0)
 
-	movementRows, err := s.pool.Query(ctx,
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel:   pgx.RepeatableRead,
+		AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		return Reconciliation{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	movementRows, err := tx.Query(ctx,
 		`SELECT p.location_id, p.sku, p.on_hand, COALESCE(m.qty, 0)
 		 FROM positions p
 		 LEFT JOIN (
@@ -231,7 +252,7 @@ func (s *Service) Reconcile(ctx context.Context, tenant string) (Reconciliation,
 		return Reconciliation{}, err
 	}
 
-	reservedRows, err := s.pool.Query(ctx,
+	reservedRows, err := tx.Query(ctx,
 		`SELECT p.location_id, p.sku, p.reserved, COALESCE(r.qty, 0)
 		 FROM positions p
 		 LEFT JOIN (
@@ -260,7 +281,7 @@ func (s *Service) Reconcile(ctx context.Context, tenant string) (Reconciliation,
 	}
 
 	var ledgerImbalance int64
-	if err := s.pool.QueryRow(ctx,
+	if err := tx.QueryRow(ctx,
 		`SELECT COALESCE(SUM(debit_cents - credit_cents), 0) FROM ledger_entries WHERE tenant_id = $1`,
 		tenant,
 	).Scan(&ledgerImbalance); err != nil {
@@ -270,7 +291,7 @@ func (s *Service) Reconcile(ctx context.Context, tenant string) (Reconciliation,
 		issues = append(issues, fmt.Sprintf("ledger is not balanced: sum(debit-credit)=%d", ledgerImbalance))
 	}
 
-	valueRows, err := s.pool.Query(ctx,
+	valueRows, err := tx.Query(ctx,
 		`SELECT p.location_id, p.sku, p.inventory_value_cents, COALESCE(l.balance, 0)
 		 FROM positions p
 		 LEFT JOIN (
@@ -299,7 +320,7 @@ func (s *Service) Reconcile(ctx context.Context, tenant string) (Reconciliation,
 	}
 
 	var transferValue, transitLedger int64
-	if err := s.pool.QueryRow(ctx,
+	if err := tx.QueryRow(ctx,
 		`SELECT
 			COALESCE((SELECT SUM(value_cents) FROM transfers WHERE tenant_id = $1 AND status = 'in_transit'), 0),
 			COALESCE((SELECT SUM(debit_cents - credit_cents) FROM ledger_entries WHERE tenant_id = $1 AND account = 'inventory_in_transit'), 0)`,
@@ -311,6 +332,9 @@ func (s *Service) Reconcile(ctx context.Context, tenant string) (Reconciliation,
 		issues = append(issues, fmt.Sprintf("in-transit value=%d but ledger=%d", transferValue, transitLedger))
 	}
 
+	if err := tx.Commit(ctx); err != nil {
+		return Reconciliation{}, err
+	}
 	return Reconciliation{
 		OK:        len(issues) == 0,
 		Issues:    issues,
@@ -538,6 +562,9 @@ func (s *Service) confirmTx(ctx context.Context, tx pgx.Tx, tenant, actor, id st
 	if r.Status == "confirmed" {
 		return r, nil
 	}
+	if r.Status == "expired" || (r.Status == "active" && !s.clock().Before(r.ExpiresAt)) {
+		return Reservation{}, fmt.Errorf("%w: reservation %s expired at %s", ErrReservationExpired, r.ID, r.ExpiresAt.Format(time.RFC3339))
+	}
 	if r.Status != "active" {
 		return Reservation{}, fmt.Errorf("%w: reservation is %s", ErrInvalidState, r.Status)
 	}
@@ -602,7 +629,7 @@ func (s *Service) releaseTx(ctx context.Context, tx pgx.Tx, tenant, actor, id st
 	if err != nil {
 		return Reservation{}, err
 	}
-	if r.Status == "released" {
+	if r.Status == "released" || r.Status == "expired" {
 		return r, nil
 	}
 	if r.Status != "active" {
@@ -934,16 +961,32 @@ func (s *Service) emit(ctx context.Context, tx pgx.Tx, tenant, aggregateType, ag
 	if err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx,
+	var eventID int64
+	var occurredAt time.Time
+	if err := tx.QueryRow(ctx,
 		`INSERT INTO inventory_events (tenant_id, aggregate_type, aggregate_id, event_type, payload, actor)
-		 VALUES ($1, $2, $3, $4, $5, $6)`,
+		 VALUES ($1, $2, $3, $4, $5, $6)
+		 RETURNING id, occurred_at`,
 		tenant, aggregateType, aggregateID, eventType, string(body), actor,
-	); err != nil {
+	).Scan(&eventID, &occurredAt); err != nil {
+		return err
+	}
+
+	envelope, err := json.Marshal(map[string]any{
+		"event_id":       eventID,
+		"event_type":     eventType,
+		"aggregate_type": aggregateType,
+		"aggregate_id":   aggregateID,
+		"actor":          actor,
+		"occurred_at":    occurredAt.UTC(),
+		"data":           json.RawMessage(body),
+	})
+	if err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO outbox (tenant_id, topic, payload) VALUES ($1, $2, $3)`,
-		tenant, "inventory.events", string(body),
+		tenant, "inventory.events", string(envelope),
 	); err != nil {
 		return err
 	}

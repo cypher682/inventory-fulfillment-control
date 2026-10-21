@@ -21,6 +21,7 @@ Base path: `/v1`. All requests require `X-Tenant-ID`. Mutating requests may send
 | 404 | `not_found` | unknown position, reservation, or transfer in this tenant |
 | 409 | `insufficient_stock` | available quantity is too low |
 | 409 | `invalid_state` | reservation is already released/confirmed |
+| 409 | `reservation_expired` | reservation expired and can no longer be confirmed |
 | 409 | `request_in_progress` | same idempotency key still executing |
 | 422 | `idempotency_mismatch` | key reused with a different body |
 | 500 | `internal` | unexpected failure |
@@ -35,13 +36,25 @@ Base path: `/v1`. All requests require `X-Tenant-ID`. Mutating requests may send
 
 Creates the tenant/location/item on first use, adds on-hand quantity and inventory value, posts `Dr inventory / Cr inventory_source`, and returns the position.
 
+### POST /v1/adjustments
+
+```json
+{"location_id":"wh-a","sku":"sku-1","quantity_delta":-2,"reason":"damaged in handling"}
+```
+
+```json
+{"location_id":"wh-a","sku":"sku-1","quantity_delta":3,"unit_cost_cents":600,"reason":"cycle count surplus"}
+```
+
+Applies a signed correction. Positive deltas add on-hand at `unit_cost_cents`; negative deltas remove on-hand at moving value and cannot consume reserved stock. Posts `Dr inventory / Cr inventory_adjustment` for gains and `Dr inventory_adjustment / Cr inventory` for losses. Returns the adjustment and the updated position.
+
 ### POST /v1/reservations
 
 ```json
 {"location_id":"wh-a","sku":"sku-1","quantity":4,"ttl_seconds":900}
 ```
 
-`ttl_seconds` defaults to 900 and is capped at 604800. Returns a reservation with `status: "active"`.
+`ttl_seconds` defaults to 900 and is capped at 604800. Returns a reservation with `status: "active"`. Expired reservations are released by a background sweeper; confirming one returns `409 reservation_expired`.
 
 ### POST /v1/reservations/{id}/confirm
 
@@ -72,7 +85,7 @@ Returns the reservation.
 
 ### GET /v1/atp?location=wh-a&sku=sku-1
 
-Returns on-hand, reserved, available, and incoming in-transit quantity. Unknown positions return `found: false` with zero quantities.
+Returns on-hand, reserved, expired-but-not-yet-swept reserved, available, and incoming in-transit quantity. Unknown positions return `found: false` with zero quantities.
 
 ### POST /v1/transfers
 
@@ -106,9 +119,27 @@ Checks:
 
 Returns `409` when `ok` is false.
 
+### GET /v1/audit/events
+
+Pages through the tenant's event log. Filters: `aggregate_type`, `aggregate_id`, `event_type`, `after`, `limit`.
+
+```json
+{"events":[{"id":42,"aggregate_type":"reservation","event_type":"reservation.confirmed","payload":{}}],"next_after":42,"has_more":true}
+```
+
+### GET /v1/audit/movements
+
+Pages through inventory movements. Filters: `location_id`, `sku`, `movement_type`, `after`, `limit`.
+
+### GET /v1/audit/ledger
+
+Pages through ledger entries. Filters: `account`, `location_id`, `sku`, `ref_type`, `ref_id`, `after`, `limit`.
+
+Audit pagination is ascending by numeric `id`. Pass the returned `next_after` as `after` for the next page. `limit` defaults to 50 and is capped at 200.
+
 ### GET /metrics
 
-Prometheus text counters: receipts, reservations, rejections, confirmations, releases, transfers, transfer receives.
+Prometheus text output: operation counters, HTTP request counts/errors, an HTTP latency histogram, and unpublished outbox gauges.
 
 ### GET /healthz, GET /readyz
 

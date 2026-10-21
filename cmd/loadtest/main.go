@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -75,6 +76,7 @@ func run(cfg config) error {
 
 	var success, insufficient, failed atomic.Int64
 	var next atomic.Int64
+	durations := make([]time.Duration, cfg.attempts)
 	start := time.Now()
 
 	var wg sync.WaitGroup
@@ -91,11 +93,13 @@ func run(cfg config) error {
 				if cfg.idempotency {
 					key = fmt.Sprintf("attempt-%d", n)
 				}
+				requestStart := time.Now()
 				status, body, err := do(client, cfg, http.MethodPost, "/v1/reservations", map[string]any{
 					"location_id": cfg.location,
 					"sku":         cfg.sku,
 					"quantity":    1,
 				}, key)
+				durations[n-1] = time.Since(requestStart)
 				switch {
 				case err != nil:
 					failed.Add(1)
@@ -124,9 +128,12 @@ func run(cfg config) error {
 	}
 
 	rate := float64(cfg.attempts) / elapsed.Seconds()
+	sort.Slice(durations, func(i, j int) bool { return durations[i] < durations[j] })
 	fmt.Printf("tenant=%s attempts=%d workers=%d\n", cfg.tenant, cfg.attempts, cfg.workers)
 	fmt.Printf("success=%d rejected=%d errors=%d in %s (%.1f req/s)\n",
 		success.Load(), insufficient.Load(), failed.Load(), elapsed.Round(time.Millisecond), rate)
+	fmt.Printf("latency: p50=%s p95=%s p99=%s max=%s\n",
+		percentile(durations, 0.50), percentile(durations, 0.95), percentile(durations, 0.99), percentile(durations, 1))
 	fmt.Printf("position: on_hand=%d reserved=%d available=%d\n", p.OnHand, p.Reserved, p.Available)
 	fmt.Printf("reconciliation: ok=%v issues=%v\n", report.OK, report.Issues)
 
@@ -191,4 +198,17 @@ func get(client *http.Client, cfg config, path string, out any) error {
 		return fmt.Errorf("decode GET %s: %w", path, err)
 	}
 	return nil
+}
+
+func percentile(sorted []time.Duration, p float64) time.Duration {
+	if len(sorted) == 0 {
+		return 0
+	}
+	if p <= 0 {
+		return sorted[0]
+	}
+	if p >= 1 {
+		return sorted[len(sorted)-1]
+	}
+	return sorted[int(float64(len(sorted)-1)*p)]
 }

@@ -64,7 +64,12 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	go outbox.Run(ctx, pool, log, time.Second)
+	relay := outbox.NewRelay(pool, outbox.LogPublisher{Log: log}, log).
+		WithInterval(cfg.OutboxInterval).
+		WithBatch(cfg.OutboxBatch)
+	go relay.Run(ctx)
+
+	go runExpiry(ctx, service, log, cfg.ExpiryInterval, cfg.ExpiryBatch)
 
 	go func() {
 		log.Info("server started", "addr", cfg.Addr(), "version", version)
@@ -91,4 +96,25 @@ func newLogger(level string) *slog.Logger {
 		lvl = slog.LevelInfo
 	}
 	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lvl}))
+}
+
+func runExpiry(ctx context.Context, service *inventory.Service, log *slog.Logger, interval time.Duration, batch int) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			expired, err := service.ExpireReservations(ctx, batch)
+			if err != nil {
+				log.Error("expire reservations", "error", err)
+				continue
+			}
+			if expired > 0 {
+				log.Info("expired reservations", "count", expired)
+			}
+		}
+	}
 }
